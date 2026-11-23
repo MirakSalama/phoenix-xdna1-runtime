@@ -522,6 +522,8 @@ struct Stream {
         return activation_values.data();
     }
     std::unique_ptr<PhoenixMatvec> npu;
+    std::unique_ptr<PhoenixQ1Matvec> q1;
+    bool q1_failed = false;
     std::unique_ptr<PhoenixPrefill> prefill;
     std::unique_ptr<CpuRemainder> cpu;
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> fallback_cpu{nullptr, ggml_backend_free};
@@ -529,6 +531,7 @@ struct Stream {
     ggml_cgraph * fallback_graph = nullptr;
     int cpu_threads = GGML_DEFAULT_N_THREADS;
     WeightCache<PhoenixMatvec> cache;
+    WeightCache<PhoenixQ1Matvec> q1_cache;
     WeightCache<PhoenixPrefill> prompt_cache;
     size_t cached_bytes = 0;
     size_t q4_cache_bytes = 0;
@@ -602,10 +605,14 @@ struct Stream {
         }
         WeightRows input{weight};
         std::shared_ptr<const typename Engine::Prepared> prepared;
-        if constexpr (std::is_same_v<Engine, PhoenixPrefill>) {
-            if (large_q4 && !use_bf16) prepared = engine.prepare_q4(rows, cols, raw, weight.extra != nullptr);
+        if constexpr (std::is_same_v<Engine, PhoenixQ1Matvec>) {
+            prepared = engine.prepare(rows, cols, raw);
+        } else {
+            if constexpr (std::is_same_v<Engine, PhoenixPrefill>) {
+                if (large_q4 && !use_bf16) prepared = engine.prepare_q4(rows, cols, raw, weight.extra != nullptr);
+            }
+            if (!prepared) prepared = engine.prepare(rows, cols, WeightRows::decode, &input);
         }
-        if (!prepared) prepared = engine.prepare(rows, cols, WeightRows::decode, &input);
         if (cost <= resident_limit && cached_bytes <= resident_limit - cost) {
             std::vector<uint8_t> snapshot;
             if (!version.allocation) snapshot.assign(raw, raw + bytes);
@@ -681,12 +688,12 @@ struct Stream {
         const ggml_tensor * weight = op->src[0];
         const size_t cols = static_cast<size_t>(weight->ne[0]);
         const size_t rows = static_cast<size_t>(weight->ne[1]);
-        if (!npu) npu = std::make_unique<PhoenixMatvec>();
         const size_t npu_rows = device_rows(rows);
         const size_t cpu_rows = rows - npu_rows;
         const auto * vector = static_cast<const float *>(op->src[1]->data);
         auto * output = static_cast<float *>(op->data);
         const auto begin = Clock::now();
+        bool used_q1 = false;
         if (cpu_rows) {
             if (!cpu || !cpu->matches(weight->type, cpu_rows, cols, cpu_threads)) {
                 cpu = std::make_unique<CpuRemainder>(weight->type, cpu_rows, cols, cpu_threads);
@@ -694,10 +701,34 @@ struct Stream {
             cpu->start(static_cast<uint8_t *>(weight->data) + weight->nb[1] * npu_rows, vector, output + npu_rows);
         }
         try {
-            auto packed = get_weight(*weight, npu_rows, *npu, cache);
-            const auto start = Clock::now();
-            npu->compute(*packed, dot_vector(weight->type, vector, cols), output);
-            compute_ms += elapsed_ms(start);
+            const float * rounded = dot_vector(weight->type, vector, cols);
+            const char * policy = std::getenv("PHOENIX_XDNA_Q1");
+            if (!q1_failed && (!policy || std::strcmp(policy, "0")) &&
+                weight->type == GGML_TYPE_Q1_0 && !weight->extra &&
+                npu_rows == PhoenixQ1Matvec::rows && cols == PhoenixQ1Matvec::cols &&
+                weight->nb[1] == PhoenixQ1Matvec::row_bytes && output_weight(weight)) {
+                try {
+                    if (!q1) q1 = std::make_unique<PhoenixQ1Matvec>();
+                    const auto packed = get_weight(*weight, npu_rows, *q1, q1_cache);
+                    const auto start = Clock::now();
+                    q1->compute(*packed, rounded, output);
+                    compute_ms += elapsed_ms(start);
+                    used_q1 = true;
+                } catch (const std::exception & error) {
+                    q1_failed = true;
+                    char line[512];
+                    std::snprintf(line, sizeof(line), "[Phoenix XDNA1] packed-q1 fallback pid=%lu reason=%.320s\n",
+                                  GetCurrentProcessId(), error.what());
+                    trace(line);
+                }
+            }
+            if (!used_q1) {
+                if (!npu) npu = std::make_unique<PhoenixMatvec>();
+                const auto packed = get_weight(*weight, npu_rows, *npu, cache);
+                const auto start = Clock::now();
+                npu->compute(*packed, rounded, output);
+                compute_ms += elapsed_ms(start);
+            }
         } catch (...) {
             if (cpu_rows) cpu->finish();
             throw;
@@ -715,9 +746,11 @@ struct Stream {
             const char * memory = source.Type == MEM_MAPPED ? "mapped" : source.Type == MEM_PRIVATE ? "private" : "other";
             char line[512];
             std::snprintf(line, sizeof(line),
-                          "[Phoenix XDNA1] dispatch pid=%lu count=%llu tensor=%.*s rows=%zu cpu_rows=%zu cols=%zu type=%s buffer=%s memory=%s protect=0x%lx hits=%llu uploads=%llu cached_mib=%zu validation_ms=%.3f prepare_ms=%.3f compute_ms=%.3f cpu_ms=%.3f wall_ms=%.3f\n",
+                          "[Phoenix XDNA1] dispatch pid=%lu count=%llu tensor=%.*s rows=%zu cpu_rows=%zu cols=%zu type=%s buffer=%s storage=%s weight_bytes=%zu memory=%s protect=0x%lx hits=%llu uploads=%llu cached_mib=%zu validation_ms=%.3f prepare_ms=%.3f compute_ms=%.3f cpu_ms=%.3f wall_ms=%.3f\n",
                           GetCurrentProcessId(), count, GGML_MAX_NAME, weight->name, npu_rows, cpu_rows, cols,
                           ggml_type_name(weight->type), weight->buffer ? ggml_backend_buffer_name(weight->buffer) : "none",
+                          used_q1 ? "packed-q1" : "expanded-bf16",
+                          used_q1 ? PhoenixQ1Matvec::packed_bytes(npu_rows, cols) : PhoenixMatvec::packed_bytes(npu_rows, cols),
                           memory, source.Protect, hits, uploads, cached_bytes >> 20,
                           validation_ms, preparation_ms, compute_ms, cpu_ms, wall_ms);
             trace(line);

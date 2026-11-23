@@ -1,121 +1,118 @@
-# Install a separate Bionic pack using the bindings from the matching local CPU runtime.
-[CmdletBinding()]
-param(
-    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
+[CmdletBinding()]param(
+    [string]$StageOnly,
     [switch]$CheckOnly
 )
-$ErrorActionPreference = 'Stop'
-$compatibility = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'compatibility.json') | ConvertFrom-Json -AsHashtable
-if (-not $Version) { $Version = $compatibility.version }
-$extensions = (Resolve-Path -LiteralPath (Join-Path $env:USERPROFILE '.lmstudio\extensions')).Path
-$backends = (Resolve-Path -LiteralPath (Join-Path $extensions 'backends')).Path
-$name = $compatibility.pack
-$official = Join-Path $backends "$($compatibility.basePack)-$($compatibility.baseVersion)"
-$target = Join-Path $backends "$name-$version"
-$binaries = @{
-    'llama-server.exe' = 'build\phoenix-server.exe'
-    'ggml-phoenix.dll' = 'build\ggml-phoenix.dll'
-    'programs\stream-gemv.xclbin' = 'programs\stream-gemv.xclbin'
+$ErrorActionPreference='Stop'
+$lock=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'runtime-lock.json') -Raw | ConvertFrom-Json -AsHashtable
+$backends=(Resolve-Path -LiteralPath (Join-Path $env:USERPROFILE '.lmstudio/extensions/backends')).Path
+$base=Join-Path $backends $lock.vulkan
+$npu=Join-Path $backends $lock.phoenix
+$target=if ($StageOnly) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StageOnly) } else { Join-Path $backends "$($lock.name)-$($lock.version)" }
+$launcher=Join-Path $PSScriptRoot 'build/phoenix-hybrid.exe'
+if (!(Test-Path -LiteralPath $launcher -PathType Leaf)) {throw 'Build the launcher or use the prebuilt experimental package.'}
+$localFiles=@{
+    'llama-server.exe' = $launcher
+    'ggml-phoenix.dll' = Join-Path $PSScriptRoot 'build/ggml-phoenix.dll'
+    'programs/bonsai-q1-3072x5120.xclbin' = Join-Path $PSScriptRoot 'programs/bonsai-q1-3072x5120.xclbin'
+    'programs/bonsai-q1-3072x5120.bin' = Join-Path $PSScriptRoot 'programs/bonsai-q1-3072x5120.bin'
 }
-foreach ($shape in $compatibility.prefillPrograms) {
-    if ($shape -notmatch '^[1-9][0-9]*x[1-9][0-9]*x(128|256)$') { throw "Invalid prefill shape: $shape" }
-    foreach ($extension in @('bin', 'xclbin')) {
-        $relative = "programs\prefill-$shape.$extension"
-        $binaries[$relative] = $relative
-    }
-}
-foreach ($shape in $compatibility.residentPrograms) {
-    if ($shape -notmatch '^[1-9][0-9]*x[1-9][0-9]*x(128|256)$') { throw "Invalid resident shape: $shape" }
-    foreach ($extension in @('bin','xclbin')) {
-        $relative = "programs\resident-$shape.$extension"
-        $binaries[$relative] = $relative
-    }
-}
-foreach ($rows in @(128,256,384,512,768,1024,1536,2048,2560,3072,4096,6144,8192,16384,32768,49152,65536)) {
-    $relative = "programs\stream-$rows.bin"
-    $binaries[$relative] = $relative
-}
-foreach ($relative in $binaries.Values) {
-    if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $relative) -PathType Leaf)) { throw "Missing build output $relative" }
-}
-if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\xrt_coreutil.dll') -PathType Leaf)) {
-    throw 'The AMD XRT runtime for Windows is required.'
-}
-$pinned = $compatibility.nativeHashes
-foreach ($file in $pinned.Keys) {
-    if ((Get-FileHash -LiteralPath (Join-Path $official $file)).Hash -ne $pinned[$file]) {
-        throw "The installed CPU llama.cpp $($compatibility.baseVersion) differs from the build used for this pack: $file"
-    }
-}
-if ($CheckOnly) {
-    $versions = Get-ChildItem -Directory -LiteralPath $backends |
-        Where-Object { $_.Name -match ('^' + [regex]::Escape($compatibility.basePack) + '-(\d+\.\d+\.\d+)$') } |
-        ForEach-Object { [version]($_.Name.Substring($compatibility.basePack.Length + 1)) } | Sort-Object -Descending
-    Write-Output "Verified CPU pack $($compatibility.baseVersion). Newest installed CPU pack: $($versions | Select-Object -First 1)."
-    return
-}
-if (Test-Path -LiteralPath $target) {
-    $existing = Get-Content -LiteralPath (Join-Path $target 'backend-manifest.json') -Raw | ConvertFrom-Json
-    if ($existing.name -ne $name -or $existing.version -ne $Version -or
-        $existing.engine_protocol_server.executable_relative_path -ne 'llama-server.exe') {
-        throw 'The existing folder contains a different or incomplete runtime manifest.'
-    }
-    foreach ($file in $pinned.Keys) {
-        if ((Get-FileHash -LiteralPath (Join-Path $target $file)).Hash -ne $pinned[$file]) {
-            throw "The existing Phoenix pack contains an incompatible Bionic library: $file"
-        }
-    }
-    foreach ($file in $binaries.Keys) {
-        if ((Get-FileHash -LiteralPath (Join-Path $target $file)).Hash -ne
-            (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $binaries[$file])).Hash) {
-            throw 'A different Phoenix pack is installed at the same version. Unload it and remove that pack in Bionic before reinstalling.'
-        }
-    }
-    Write-Output "Already installed: $name@$version"
-    return
+if ($null -eq $lock.payloadFiles -or $lock.payloadFiles.Count -ne $localFiles.Count) {throw 'The candidate payload checksum lock is incomplete.'}
+foreach ($name in $localFiles.Keys) {
+    if (!(Test-Path -LiteralPath $localFiles[$name] -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $localFiles[$name]).Hash -ne $lock.payloadFiles[$name]) {throw "Candidate payload missing or changed: $name"}
 }
 
-$stageName = '.phoenix-xdna1-stage-' + [guid]::NewGuid().ToString('N')
-$stage = Join-Path $extensions $stageName
-$null = New-Item -ItemType Directory -Path $stage
-try {
-    # Native bindings stay with their original version; they run model inspection.
-    foreach ($f in Get-ChildItem -LiteralPath $official -File) {
-        if (-not $binaries.ContainsKey($f.Name)) { Copy-Item -LiteralPath $f.FullName -Destination $stage }
-    }
-    $null = New-Item -ItemType Directory -Path (Join-Path $stage 'programs')
-    foreach ($file in $binaries.Keys) {
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $binaries[$file]) -Destination (Join-Path $stage $file)
-    }
-    $manifestPath = Join-Path $stage 'backend-manifest.json'
-    $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-    $manifest.name = $name
-    $manifest.version = $version
-    $manifest.domains = @('llm')
-    $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
-    '[["en",{"langKey":"en","displayName":"Phoenix XDNA 1 (Windows)","description":"Accelerates supported GGUF prompt projections on the AMD XDNA 1 NPU. Split-head mode also shares supported output projections with the CPU during generation.","releaseNotes":[]}]]' |
-        Set-Content -LiteralPath (Join-Path $stage 'display-data.json') -Encoding utf8NoBOM
-    $artPath = Join-Path $stage 'engine-protocol-server-artifacts.json'
-    $artifacts = Get-Content -Raw -LiteralPath $artPath | ConvertFrom-Json
-    foreach ($file in $binaries.Keys | Sort-Object) {
-        $relative = $file.Replace('\','/')
-        if ($artifacts.files.relative_path -notcontains $relative) {
-            $artifacts.files += [pscustomobject]@{ relative_path = $relative; executable = $false }
+function Assert-Inputs($root,$files) {
+    foreach ($name in $files.Keys) {
+        if ($name -notmatch '^(programs/)?[a-zA-Z0-9_.-]+$' -or $name.Contains('..')) {throw 'Unsafe input lock path'}
+        $src=Join-Path $root $name
+        if (!(Test-Path -LiteralPath $src -PathType Leaf) -or (Get-FileHash -LiteralPath $src).Hash -ne $files[$name]) {
+            throw "Pinned runtime file missing or changed: $name"
         }
     }
-    $artifacts | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $artPath -Encoding utf8NoBOM
-    & (Join-Path $stage 'llama-server.exe') --phoenix-self-test
-    if ($LASTEXITCODE -ne 0) { throw "Staged Phoenix hardware self-test failed ($LASTEXITCODE)." }
-    if ((Resolve-Path -LiteralPath $stage).Path -ne (Join-Path $extensions $stageName) -or
-        [IO.Path]::GetFullPath($target) -ne (Join-Path $backends "$name-$version") -or (Test-Path -LiteralPath $target)) {
-        throw 'Installation paths changed during staging.'
+}
+$retained=@{}
+foreach ($name in $lock.vulkanFiles.Keys) {
+    if ($name -notin 'backend-manifest.json','display-data.json','engine-protocol-server-artifacts.json','llama-server.exe') {$retained[$name]=$lock.vulkanFiles[$name]}
+}
+$class='HKLM:/SYSTEM/CurrentControlSet/Control/Class/{4d36e968-e325-11ce-bfc1-08002be10318}'
+$drivers=@(Get-ChildItem $class -ErrorAction SilentlyContinue | ForEach-Object {$_.GetValue('VulkanDriverName')} |
+    Where-Object {$_ -like '*\amd-vulkan64.json' -and (Test-Path -LiteralPath $_ -PathType Leaf)} | Sort-Object -Unique)
+$driverPath = if ($drivers.Count -eq 1) {[string]$drivers[0]} else {''}
+if (Test-Path -LiteralPath $target) {
+    if ((Get-Item -Force -LiteralPath $target).Attributes -band [IO.FileAttributes]::ReparsePoint) {throw 'Unexpected linked runtime directory.'}
+    $manifest=Get-Content -LiteralPath (Join-Path $target 'backend-manifest.json') -Raw | ConvertFrom-Json
+    if ($manifest.name -ne $lock.name -or $manifest.version -ne $lock.version -or
+        (Get-FileHash -LiteralPath "$target/llama-server.exe").Hash -ne (Get-FileHash -LiteralPath $launcher).Hash) {
+        throw "Another runtime already occupies $target"
     }
-    [IO.Directory]::Move($stage, $target)
+    Assert-Inputs $target $retained
+    Assert-Inputs $target $lock.phoenixFiles
+    Assert-Inputs $target $lock.payloadFiles
+    $icdPath=Join-Path $target 'amd-icd.txt'
+    $currentDriver=if (Test-Path -LiteralPath $icdPath -PathType Leaf) {(Get-Content -Raw -LiteralPath $icdPath).Trim()}
+    if ($currentDriver -ne $driverPath) {
+        if ($CheckOnly) {throw 'The installed AMD driver path has changed. Re-run install.ps1 to refresh it.'}
+        $tempDriver=Join-Path $target ('.driver-'+[guid]::NewGuid().ToString('N'))
+        try {
+            [IO.File]::WriteAllText($tempDriver,$driverPath+[Environment]::NewLine,[Text.Encoding]::ASCII)
+            [IO.File]::Move($tempDriver,$icdPath,$true)
+        } finally {
+            if (Test-Path -LiteralPath $tempDriver) {Remove-Item -LiteralPath $tempDriver}
+        }
+        Write-Output 'Updated the AMD Vulkan driver path for subsequent workers.'
+    }
+    Write-Output "Already installed at $target"
+    return
+}
+foreach ($source in $base,$npu) {
+    if (!(Test-Path -LiteralPath $source -PathType Container)) {throw "Install the exact pinned source runtime first: $source"}
+}
+Assert-Inputs $base $lock.vulkanFiles
+Assert-Inputs $npu $lock.phoenixFiles
+if ($CheckOnly) {Write-Output "Verified $($lock.vulkan), $($lock.phoenix) and the candidate payload. Radeon driver available: $([bool]$driverPath)"; return}
+$parent=[IO.Path]::GetDirectoryName($target)
+$null=[IO.Directory]::CreateDirectory($parent)
+$stagingParent=if ($StageOnly) {$parent} else {[IO.Path]::GetDirectoryName($backends)}
+$tmp=Join-Path $stagingParent ('.hybrid-stage-'+[guid]::NewGuid().ToString('N'))
+$null=New-Item -ItemType Directory -Path $tmp
+try {
+    foreach ($name in $lock.vulkanFiles.Keys) {
+        if ($name -ne 'llama-server.exe') { Copy-Item -LiteralPath (Join-Path $base $name) -Destination (Join-Path $tmp $name) }
+    }
+    $null=[IO.Directory]::CreateDirectory((Join-Path $tmp 'programs'))
+    foreach ($name in $lock.phoenixFiles.Keys) {
+        Copy-Item -LiteralPath (Join-Path $npu $name) -Destination (Join-Path $tmp $name)
+    }
+    foreach ($name in $localFiles.Keys) {
+        Copy-Item -LiteralPath $localFiles[$name] -Destination (Join-Path $tmp $name)
+    }
+    [IO.File]::WriteAllText("$tmp/amd-icd.txt",$driverPath+[Environment]::NewLine,[Text.Encoding]::ASCII)
+    $manifest=Get-Content -Raw -LiteralPath "$tmp/backend-manifest.json" | ConvertFrom-Json
+    $manifest.name=$lock.name
+    $manifest.version=$lock.version
+    $manifest.domains=@('llm')
+    $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$tmp/backend-manifest.json" -Encoding utf8NoBOM
+    $label = if ($lock.name -eq 'phoenix-bonsai-preview-win-x86_64-avx2') {'Phoenix Bonsai XDNA 1 (Release Candidate)'} else {'Phoenix XDNA 1 (Windows)'}
+    $display = [object[]]::new(1)
+    $display[0] = @('en',@{langKey='en';displayName=$label;description='GGUF inference with CPU and XDNA 1, optional Radeon placements, and packed one-bit Bonsai output scoring.';releaseNotes=@()})
+    ConvertTo-Json -Depth 6 -InputObject $display | Set-Content -LiteralPath "$tmp/display-data.json" -Encoding utf8NoBOM
+    $art=Get-Content -Raw -LiteralPath "$tmp/engine-protocol-server-artifacts.json" | ConvertFrom-Json
+    foreach ($name in @($lock.phoenixFiles.Keys)+@($lock.payloadFiles.Keys | Where-Object {$_ -ne 'llama-server.exe'})+@('amd-icd.txt')) {
+        $art.files+= [pscustomobject]@{relative_path=$name;executable=$false}
+    }
+    $art | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$tmp/engine-protocol-server-artifacts.json" -Encoding utf8NoBOM
+    Assert-Inputs $tmp $retained
+    Assert-Inputs $tmp $lock.phoenixFiles
+    Assert-Inputs $tmp $lock.payloadFiles
+    [IO.Directory]::Move($tmp,$target)
 } finally {
-    if ((Test-Path -LiteralPath $stage) -and (Resolve-Path -LiteralPath $stage).Path -eq (Join-Path $extensions $stageName) -and
-        -not ((Get-Item -LiteralPath $stage).Attributes -band [IO.FileAttributes]::ReparsePoint) -and
-        -not (Get-ChildItem -LiteralPath $stage -Force -Recurse | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
-        Remove-Item -LiteralPath $stage -Recurse -Force
+    if (Test-Path -LiteralPath $tmp) {
+        $resolved=(Resolve-Path -LiteralPath $tmp).Path
+        if ([IO.Path]::GetDirectoryName($resolved) -ne $stagingParent -or [IO.Path]::GetFileName($resolved) -notmatch '^\.hybrid-stage-[0-9a-f]{32}$' -or
+            ((Get-Item -Force -LiteralPath $resolved).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            (Get-ChildItem -LiteralPath $resolved -Recurse -Force | Where-Object {$_.Attributes -band [IO.FileAttributes]::ReparsePoint})) {throw 'Unexpected temporary installation path'}
+        Remove-Item -LiteralPath $resolved -Recurse -Force
     }
 }
-Write-Output "Installed: $name@$version"
+Write-Output "Prepared $($lock.name)@$($lock.version) at $target"

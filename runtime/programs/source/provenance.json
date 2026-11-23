@@ -1,0 +1,35 @@
+{
+  "variant": "paired16",
+  "device": "NPU1 (XDNA 1, Ryzen 5 8645HS)",
+  "cores": 16,
+  "shape": [
+    3072,
+    5120
+  ],
+  "port_bytes": {
+    "weights": 2211840,
+    "activation": 10800,
+    "output": 12288
+  },
+  "packages": {
+    "mlir_aie": "1.4.3",
+    "llvm_aie": "22.0.0.2026090701+3e93bf7b"
+  },
+  "sources": {
+    "bonsai_q1.py": "18c9214b7978041714353de4e8e16bf4431f01c3261087895411c342d86e7912",
+    "bonsai_q1_vec.cc": "9b455df5d9d3f6816fc8d4ebe0a997cdefbebfd8815d8dff939484ece8cba9e7",
+    "bonsai_q1.cc": "6e3af2d097e52692c03a5f2f025a77b5609cda54e36e8aedd1f0c5a80512f42e",
+    "build-programs.ps1": "19b5e4037a4400b6286511890d08115fcbd36c4704b50580a504af6dca2d6a61"
+  },
+  "programs": {
+    "bonsai-q1-3072x5120.bin": "86408450a3c80307a73a690f89a048eeab20761e7e6217df6f0839d4edfc1925",
+    "bonsai-q1-3072x5120.xclbin": "0c4b220ac3baa7c57e35b765825353151181e4039aab535f59bf566d79b737a3"
+  },
+  "rebuild_contents": {
+    "insts.bin": "86408450a3c80307a73a690f89a048eeab20761e7e6217df6f0839d4edfc1925",
+    "cdo_main/main_aie_cdo_elfs.bin": "818b26ae9c36794947fae2d35ced6e0eb96fca637a91412d03a54404e22924d1",
+    "cdo_main/main_aie_cdo_init.bin": "4af094a3ee23043e8d6ead4338aeeef9f7cfb8f42425c220d19e8ec20fb2c00a",
+    "cdo_main/main_aie_cdo_enable.bin": "a103b9d9a1ced86938a23c8e98f79772fdcb6bb6ad7c37e99d2c420bef9f8b47"
+  },
+  "development_build_script_sha256": "22664cfc9698993a6041e8f0b47d4f2e6f219f47088a7423caf826ace9956cea"
+}

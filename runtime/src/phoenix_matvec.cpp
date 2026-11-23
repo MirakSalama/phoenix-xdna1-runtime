@@ -275,3 +275,87 @@ void PhoenixMatvec::compute(const std::uint16_t* weights, const float* vector, f
         }
     }
 }
+
+struct PhoenixQ1Matvec::Prepared {
+    xrt::bo weights;
+};
+
+struct PhoenixQ1Matvec::Impl {
+    xrt::device device{0};
+    xrt::xclbin binary;
+    xrt::hw_context hw;
+    xrt::kernel kernel;
+    xrt::bo code, vector, result;
+    xrt::run run;
+
+    Impl() {
+        const auto name = device.get_info<xrt::info::device::name>();
+        if (name.find("Phoenix") == std::string::npos && name.find("Hawk") == std::string::npos)
+            throw std::runtime_error("Expected XDNA 1, found " + name);
+        const auto directory = program_directory();
+        binary = xrt::xclbin(read_program(directory / "bonsai-q1-3072x5120.xclbin"));
+        device.register_xclbin(binary);
+        hw = xrt::hw_context(device, binary.get_uuid());
+        kernel = xrt::kernel(hw, "MLIR_AIE");
+        const auto instructions = read_program(directory / "bonsai-q1-3072x5120.bin");
+        if (instructions.size() % sizeof(uint32_t)) throw std::runtime_error("Unaligned Q1 XRT instructions");
+        code = xrt::bo(device, instructions.size(), xrt::bo::flags::cacheable, kernel.group_id(1));
+        code.write(instructions.data(), instructions.size(), 0);
+        code.sync(to_device);
+        // The DMA transfer includes 560 zero bytes after the BF16 vector.
+        vector = xrt::bo(device, 10800, xrt::bo::flags::host_only, 0);
+        std::memset(vector.map<void*>(), 0, vector.size());
+        vector.sync(to_device);
+        result = xrt::bo(device, rows * sizeof(float), xrt::bo::flags::host_only, 0);
+        run = xrt::run(kernel);
+        run.set_arg(0, uint64_t{3});
+        run.set_arg(1, code);
+        run.set_arg(2, static_cast<uint32_t>(instructions.size()));
+        run.set_arg(4, vector);
+        run.set_arg(5, result);
+    }
+};
+
+PhoenixQ1Matvec::PhoenixQ1Matvec() : context_(std::make_unique<Impl>()) {}
+PhoenixQ1Matvec::~PhoenixQ1Matvec() = default;
+
+std::size_t PhoenixQ1Matvec::packed_bytes(std::size_t height, std::size_t width) {
+    if (height != rows || width != cols) throw std::invalid_argument("Unsupported packed Q1 shape");
+    return rows * row_bytes;
+}
+
+std::shared_ptr<const PhoenixQ1Matvec::Prepared> PhoenixQ1Matvec::prepare(
+    std::size_t height, std::size_t width, const std::uint8_t* data) {
+    if (!data) throw std::invalid_argument("Missing Q1 weight rows");
+    const auto bytes = packed_bytes(height, width);
+    for (size_t block = 0; block < bytes; block += 18) {
+        std::uint16_t scale;
+        std::memcpy(&scale, data + block, sizeof(scale));
+        if ((scale & 0x7c00u) == 0x7c00u) {
+            throw std::invalid_argument("Non-finite FP16 Q1 block scale");
+        }
+    }
+    auto prepared = std::make_shared<Prepared>();
+    prepared->weights = xrt::bo(context_->device, bytes, xrt::bo::flags::host_only, 0);
+    std::memcpy(prepared->weights.map<void*>(), data, bytes);
+    prepared->weights.sync(to_device);
+    return prepared;
+}
+
+void PhoenixQ1Matvec::compute(const Prepared& weights, const float* vector, float* output) {
+    auto& state = *context_;
+    auto input = state.vector.map<std::uint16_t*>();
+    for (size_t i = 0; i < cols; ++i) {
+        input[i] = to_bf16(vector[i]);
+        if ((input[i] & 0x7f80u) == 0x7f80u) throw std::invalid_argument("Non-finite Q1 activation");
+    }
+    state.vector.sync(to_device, cols * sizeof(*input), 0);
+    state.run.set_arg(3, weights.weights);
+    state.run.start();
+    const auto completed = state.run.wait(std::chrono::seconds(30));
+    if (completed == ERT_CMD_STATE_TIMEOUT) state.run.abort();
+    if (completed != ERT_CMD_STATE_COMPLETED)
+        throw std::runtime_error("Packed Q1 XRT command ended in state " + std::to_string(static_cast<int>(completed)));
+    state.result.sync(from_device);
+    std::copy_n(state.result.map<const float*>(), rows, output);
+}
