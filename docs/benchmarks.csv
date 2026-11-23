@@ -1,0 +1,11 @@
+metric,model,inference_engine,value
+first_visible_s,LFM3-1.7B,CPU,7.929
+first_visible_s,LFM3-1.7B,Phoenix,4.239
+first_visible_s,LFM3-1.7B,Radeon,0.935
+first_visible_s,Gemma 4 E2B,CPU,3.851
+first_visible_s,Gemma 4 E2B,Phoenix,2.517
+first_visible_s,Gemma 4 E2B,Radeon,0.545
+busy_frame_p95_ms,LFM3-1.7B,Phoenix,2.91
+busy_frame_p95_ms,LFM3-1.7B,Radeon,25.19
+busy_frame_p95_ms,Gemma 4 E2B,Phoenix,2.37
+busy_frame_p95_ms,Gemma 4 E2B,Radeon,16.96

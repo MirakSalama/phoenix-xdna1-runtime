@@ -1,3 +1,4 @@
 * text=auto
 runtime/** -text
+publish/notices/** -text
 *.png -text
