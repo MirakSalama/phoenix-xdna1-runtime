@@ -12,8 +12,9 @@ from uuid import uuid4
 
 LMS_ROOT = Path(os.environ["USERPROFILE"]) / ".lmstudio"
 CLI = LMS_ROOT / "bin/lms.exe"
-PHOENIX = "phoenix-xdna1-win-x86_64-avx2@0.1.0"
-CPU = "llama.cpp-win-x86_64-avx2@2.80.1"
+RELEASE = json.loads((Path(__file__).resolve().parents[1] / "compatibility.json").read_text(encoding="utf8"))
+PHOENIX = f"{RELEASE['pack']}@{RELEASE['version']}"
+CPU = f"{RELEASE['basePack']}@{RELEASE['baseVersion']}"
 MODELS = ["lfm2.5-230m@q4_k_m", "smollm2-360m-instruct"]
 QUESTION = "What is the capital of France? Answer in a short sentence."
 CSI = re.compile(r"\x1b\[[\d;?]*[A-Za-z]")

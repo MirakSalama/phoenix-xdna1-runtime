@@ -1,18 +1,27 @@
 # Install a separate Bionic pack using the bindings from the matching local CPU runtime.
 [CmdletBinding()]
-param()
+param(
+    [ValidatePattern('^\d+\.\d+\.\d+$')][string]$Version,
+    [switch]$CheckOnly
+)
 $ErrorActionPreference = 'Stop'
+$compatibility = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'compatibility.json') | ConvertFrom-Json -AsHashtable
+if (-not $Version) { $Version = $compatibility.version }
 $extensions = (Resolve-Path -LiteralPath (Join-Path $env:USERPROFILE '.lmstudio\extensions')).Path
 $backends = (Resolve-Path -LiteralPath (Join-Path $extensions 'backends')).Path
-$name = 'phoenix-xdna1-win-x86_64-avx2'
-$version = '0.1.0'
-$official = Join-Path $backends 'llama.cpp-win-x86_64-avx2-2.80.1'
+$name = $compatibility.pack
+$official = Join-Path $backends "$($compatibility.basePack)-$($compatibility.baseVersion)"
 $target = Join-Path $backends "$name-$version"
 $binaries = @{
     'llama-server.exe' = 'build\phoenix-server.exe'
     'ggml-phoenix.dll' = 'build\ggml-phoenix.dll'
-    'programs\gemv-3072x1024.xclbin' = 'programs\gemv-3072x1024.xclbin'
-    'programs\gemv-3072x1024.bin' = 'programs\gemv-3072x1024.bin'
+    'programs\stream-gemv.xclbin' = 'programs\stream-gemv.xclbin'
+    'programs\prefill-2560x960x128.bin' = 'programs\prefill-2560x960x128.bin'
+    'programs\prefill-2560x960x128.xclbin' = 'programs\prefill-2560x960x128.xclbin'
+}
+foreach ($rows in @(128,256,384,512,768,1024,1536,2048,2560,3072,4096,6144,8192,16384,32768,49152,65536)) {
+    $relative = "programs\stream-$rows.bin"
+    $binaries[$relative] = $relative
 }
 foreach ($relative in $binaries.Values) {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $relative) -PathType Leaf)) { throw "Missing build output $relative" }
@@ -20,16 +29,30 @@ foreach ($relative in $binaries.Values) {
 if (-not (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'System32\xrt_coreutil.dll') -PathType Leaf)) {
     throw 'The AMD XRT runtime for Windows is required.'
 }
-$pinned = @{
-    'ggml-base.dll' = 'B3C7555601B62248F22413135CBC29B81613176D32DC2CA4C4DBBA6D4E36F410'
-    'llama-server-impl.dll' = 'E12AAA278E59F20CE92E80BA07B2BBE6147E7BB9FA9BDBFF969BFCFB6E349551'
-}
+$pinned = $compatibility.nativeHashes
 foreach ($file in $pinned.Keys) {
     if ((Get-FileHash -LiteralPath (Join-Path $official $file)).Hash -ne $pinned[$file]) {
-        throw "The installed CPU llama.cpp 2.80.1 differs from the build used for this pack: $file"
+        throw "The installed CPU llama.cpp $($compatibility.baseVersion) differs from the build used for this pack: $file"
     }
 }
+if ($CheckOnly) {
+    $versions = Get-ChildItem -Directory -LiteralPath $backends |
+        Where-Object { $_.Name -match ('^' + [regex]::Escape($compatibility.basePack) + '-(\d+\.\d+\.\d+)$') } |
+        ForEach-Object { [version]($_.Name.Substring($compatibility.basePack.Length + 1)) } | Sort-Object -Descending
+    Write-Output "Verified CPU pack $($compatibility.baseVersion). Newest installed CPU pack: $($versions | Select-Object -First 1)."
+    return
+}
 if (Test-Path -LiteralPath $target) {
+    $existing = Get-Content -LiteralPath (Join-Path $target 'backend-manifest.json') -Raw | ConvertFrom-Json
+    if ($existing.name -ne $name -or $existing.version -ne $Version -or
+        $existing.engine_protocol_server.executable_relative_path -ne 'llama-server.exe') {
+        throw 'The existing folder contains a different or incomplete runtime manifest.'
+    }
+    foreach ($file in $pinned.Keys) {
+        if ((Get-FileHash -LiteralPath (Join-Path $target $file)).Hash -ne $pinned[$file]) {
+            throw "The existing Phoenix pack contains an incompatible Bionic library: $file"
+        }
+    }
     foreach ($file in $binaries.Keys) {
         if ((Get-FileHash -LiteralPath (Join-Path $target $file)).Hash -ne
             (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $binaries[$file])).Hash) {
@@ -69,6 +92,8 @@ try {
         }
     }
     $artifacts | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $artPath -Encoding utf8NoBOM
+    & (Join-Path $stage 'llama-server.exe') --phoenix-self-test
+    if ($LASTEXITCODE -ne 0) { throw "Staged Phoenix hardware self-test failed ($LASTEXITCODE)." }
     if ((Resolve-Path -LiteralPath $stage).Path -ne (Join-Path $extensions $stageName) -or
         [IO.Path]::GetFullPath($target) -ne (Join-Path $backends "$name-$version") -or (Test-Path -LiteralPath $target)) {
         throw 'Installation paths changed during staging.'

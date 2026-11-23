@@ -1,10 +1,10 @@
-# Phoenix XDNA 1 for Bionic 0.1.0
+# Phoenix XDNA 1 for Bionic 0.2.0
 
-Phoenix 0.1.0 introduced local GGUF chat on first-generation AMD XDNA hardware in Bionic. Bionic loads the model and runs tokenization, attention, prompt processing and sampling. During generation, eligible dense matrix-vector products run on the NPU using the weights from the selected GGUF.
+Phoenix 0.2.0 retains prepared weights in bounded per-instance buffers. The CPU and NPU compute distinct rows of the vocabulary projection concurrently. On supported prompts of 96–512 tokens, the NPU also processes 960-by-2,560 feed-forward projections, including those used by SmolLM2-360M.
 
-On a Ryzen 5 8645HS, the original LFM2.5-230M and SmolLM2-360M four-bit GGUFs returned the same eight-token reply as CPU. One request after model load took 2.453 s and 5.328 s respectively on Phoenix, versus 0.078 s and 0.203 s on CPU. Traces recorded completed NPU work during both responses.
+On a Ryzen 5 8645HS, a warm eight-token chat reply reached 186.30 output tokens/s on LFM2.5-230M and 98.81 on SmolLM2-360M, versus 3.23 and 1.39 on Phoenix 0.1.0. The corresponding stock CPU rates were 214.63 and 112.75. For a 266–267-token SmolLM2 prompt, median warm time to first token fell from 799 ms on CPU to 595 ms on Phoenix. Four warm requests followed the first request on each loaded model.
 
-This early implementation converts and stages weights on repeated calls. It provides a baseline for later releases.
+All 40 recorded release replies matched the paired CPU text and token counts. Model loading, unsupported operations and sampling continue to use the pinned Bionic CPU runtime.
 
 ## Install
 
@@ -14,14 +14,14 @@ Extract the ZIP to a new directory. In PowerShell 7, run the following from that
 
 ```powershell
 .\install.ps1
-lms runtime select phoenix-xdna1-win-x86_64-avx2@0.1.0
+lms runtime select phoenix-xdna1-win-x86_64-avx2@0.2.0
 ```
 
-Alternatively select **Phoenix XDNA 1 (Windows) 0.1.0** in Bionic's GGUF runtime settings. Unload and reload the model. To roll back, select the previous engine and reload the model.
+Alternatively select **Phoenix XDNA 1 (Windows) 0.2.0** in Bionic's GGUF runtime settings. Unload and reload the model. To roll back, select the previous engine and reload the model.
 
 ## Verify and build
 
-Use the local Bionic chat test in `tests/bionic_chat.py` to compare CPU and Phoenix on the installed test GGUFs. Supply a fresh filename using `--report`.
+Run `.\verify.ps1 -ModelRoot <model-library>` with the installed test GGUFs. The verifier opens local Bionic instances and compares CPU and Phoenix responses. 
 
 The release archive includes the Phoenix host and compiled NPU programs. To rebuild the host, install Visual Studio C++ Build Tools, the Windows SDK and a matching AMD XRT SDK. Run `.\build.ps1 -XrtSdk <sdk-directory>`. The third-party NPU toolchain is separate. The device sources and their attribution are under `programs`. Where included, `programs/source/build-programs.ps1 -Toolchain <toolchain-directory>` rebuilds the device programs with a compatible IRON toolchain layout.
 

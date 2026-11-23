@@ -1,9 +1,9 @@
-# Phoenix XDNA 1 v0.1.0 — GGUF chat on the Windows Ryzen AI NPU
+# Phoenix XDNA 1 v0.2.0 — Cached weights and shared CPU/NPU generation
 
-This first Windows Bionic pack runs text generation from ordinary GGUF files with selected matrix operations on the AMD XDNA 1 NPU. Bionic’s llama.cpp engine loads the weights and handles prompt processing, sampling and unsupported operations.
+Phoenix now caches the weights it prepares from your GGUF. An eight-core streaming kernel processes eligible vocabulary rows while the CPU computes the remaining rows. Long enough SmolLM2 prompts can also use the NPU for selected feed-forward operations.
 
-On a Ryzen 5 8645HS, LFM2.5-230M Q4_K_M and SmolLM2-360M Instruct Q4_K_M both returned the same eight-token answer as the CPU. Hardware traces recorded completed NPU work during both requests. After loading, Phoenix took 2.45 seconds on LFM2.5 and 5.33 on SmolLM2. CPU took 0.08 and 0.20 seconds, respectively. Preparing and transferring weights repeatedly limited this version’s speed.
+On the same warm eight-token reply used to compare the two packs, LFM2.5-230M rose from **3.23 to 186.30 output tokens/s**, and SmolLM2-360M from **1.39 to 98.81**. These are whole-runtime generation rates measured against version 0.1.0. Stock CPU reached 214.63 and 112.75 tokens/s on that task. On a 266–267-token SmolLM2 prompt, Phoenix delivered the first warm token in 595 ms versus 799 ms on CPU. The first request after loading took 911 ms versus 876 ms on CPU.
 
-Extract the runtime ZIP from **Assets**, run `.\install.ps1` in PowerShell 7, select **Phoenix XDNA 1 (Windows) 0.1.0** in Bionic and reload the model. This pack requires Bionic’s Windows x64 CPU llama.cpp 2.80.1 and a working XDNA 1 XRT driver. [Versioned source and setup](https://github.com/MirakSalama/phoenix-xdna1-runtime/tree/v0.1.0/runtime)
+The installer checks the local Bionic CPU pack and stages the version separately. The verification harness compares CPU and Phoenix replies in Bionic and checks for completed NPU operations. Extract the runtime ZIP in **Assets**, run `.\install.ps1` and select **Phoenix XDNA 1 (Windows) 0.2.0**. [Versioned source and setup](https://github.com/MirakSalama/phoenix-xdna1-runtime/tree/v0.2.0/runtime)
 
-[Download the Windows runtime ZIP](https://github.com/MirakSalama/phoenix-xdna1-runtime/releases/download/v0.1.0/Phoenix-XDNA1-0.1.0.zip) · [Runtime sources and installation](runtime/README.md) · [Third-party notices](runtime/THIRD_PARTY_NOTICES.md)
+[Download the Windows runtime ZIP](https://github.com/MirakSalama/phoenix-xdna1-runtime/releases/download/v0.2.0/Phoenix-XDNA1-0.2.0.zip) · [Runtime sources and installation](runtime/README.md) · [Third-party notices](runtime/THIRD_PARTY_NOTICES.md)
