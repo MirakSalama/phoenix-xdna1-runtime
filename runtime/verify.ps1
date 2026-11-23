@@ -4,6 +4,7 @@ param(
     [string]$Results = (Join-Path (Get-Location).Path ('results\verify-' + (Get-Date -Format yyyyMMdd-HHmmss))),
     [string]$ModelRoot = (Join-Path $env:USERPROFILE '.lmstudio/models'),
     [switch]$IncludeLargeModels,
+    [switch]$VerifyResidentBF16,
     [switch]$AllowEquivalentCityAnswer,
     [ValidateSet('paris','count','prefill128','prefill256')]
     [string[]]$Workloads = @('paris','count','prefill128','prefill256')
@@ -29,6 +30,12 @@ foreach ($shape in $release.prefillPrograms) {
         $payload[$file] = $file
     }
 }
+foreach ($shape in $release.residentPrograms) {
+    foreach ($extension in @('bin','xclbin')) {
+        $file = "programs\resident-$shape.$extension"
+        $payload[$file] = $file
+    }
+}
 foreach ($file in Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'programs') -Filter 'stream-*' -File) {
     $relative = "programs\$($file.Name)"
     $payload[$relative] = $relative
@@ -43,7 +50,7 @@ $smol = Join-Path $ModelRoot 'bartowski\SmolLM2-360M-Instruct-GGUF\SmolLM2-360M-
 $lfm = Join-Path $ModelRoot 'LiquidAI\LFM3-1.7B-GGUF\LFM3-1.7B-QAD-Q4_0.gguf'
 $gemma = Join-Path $ModelRoot 'ggml-org\gemma-4-E2B-it-GGUF\gemma-4-E2B-it-Q4_0.gguf'
 $fixtures = [ordered]@{ q5_0 = $smol }
-if ($IncludeLargeModels) {
+if ($IncludeLargeModels -or $VerifyResidentBF16) {
     $fixtures['q4_0-lfm3'] = $lfm
     $fixtures['q4_0-lfm3-down'] = $lfm
     $fixtures['q4_0-gemma'] = $gemma
@@ -97,6 +104,37 @@ try {
             if ($LASTEXITCODE) { throw "Canonical GGUF projection test failed. See $log." }
         }
     }
+    if ($VerifyResidentBF16) {
+        # Test real GGUFs directly in child processes without touching Bionic's stored mode.
+        $savedResident = $env:PHOENIX_XDNA_RESIDENT_BF16
+        $savedBudget = $env:PHOENIX_XDNA_PROMPT_CACHE_MIB
+        try {
+            $env:PHOENIX_XDNA_RESIDENT_BF16 = '1'
+            $env:PHOENIX_XDNA_PROMPT_CACHE_MIB = $null
+            foreach ($fixture in $fixtures.Keys | Where-Object { $_ -ne 'q5_0' }) {
+                $storage = if ($fixture -eq 'q4_0-lfm3-down') { 'compact-q4' } else { 'resident-bf16' }
+                foreach ($tokens in @(129,257)) {
+                    foreach ($layout in @('canonical','repacked')) {
+                        [string[]]$options = if ($layout -eq 'canonical') { @('cpu-buffer') } else { @() }
+                        $log = Join-Path $Results "resident-$fixture-$tokens-$layout.log"
+                        & $numeric $cpu $plugin $fixture $fixtures[$fixture] $tokens @options *> $log
+                        if ($LASTEXITCODE -or !(Select-String -LiteralPath $log -SimpleMatch "storage=$storage " -Quiet)) {
+                            throw "Resident regression expected $storage. Check available RAM and see $log."
+                        }
+                    }
+                }
+            }
+            $env:PHOENIX_XDNA_RESIDENT_BF16 = '0'
+            $log = Join-Path $Results 'resident-disabled.log'
+            & $numeric $cpu $plugin 'q4_0-lfm3' $lfm 129 *> $log
+            if ($LASTEXITCODE -or !(Select-String -LiteralPath $log -SimpleMatch 'storage=compact-q4 ' -Quiet)) {
+                throw "Compact control failed. See $log."
+            }
+        } finally {
+            $env:PHOENIX_XDNA_RESIDENT_BF16 = $savedResident
+            $env:PHOENIX_XDNA_PROMPT_CACHE_MIB = $savedBudget
+        }
+    }
 } finally { $env:PATH = $previousPath }
 $harness = Join-Path $PSScriptRoot 'tests\bionic_performance.py'
 foreach ($workload in $Workloads) {
@@ -106,7 +144,7 @@ foreach ($workload in $Workloads) {
     & python -B $harness cpu --workload $workload @request --report $baseline
     if ($LASTEXITCODE) { throw "CPU $workload benchmark failed." }
     [string[]]$comparison = if ($longPrompt) { @('--enable-prefill', '--require-prefill-on', 'smollm2-360m-instruct') } else { @() }
-    & python -B $harness $alias --workload $workload @request --reference $baseline @comparison --report (Join-Path $Results "phoenix-$workload.json")
+    & python -B $harness $alias --placement split-head --workload $workload @request --reference $baseline @comparison --report (Join-Path $Results "phoenix-$workload.json")
     if ($LASTEXITCODE) { throw "Phoenix $workload benchmark failed." }
 }
 if ($IncludeLargeModels) {
@@ -125,7 +163,7 @@ if ($IncludeLargeModels) {
         if ($AllowEquivalentCityAnswer -and $workload -eq 'prefill256') {
             $comparison += '--allow-equivalent-city-answer'
         }
-        & python -B $harness $alias --workload $workload @models @request @comparison --reference $baseline --report (Join-Path $Results "phoenix-large-$workload.json")
+        & python -B $harness $alias --placement split-head --workload $workload @models @request @comparison --reference $baseline --report (Join-Path $Results "phoenix-large-$workload.json")
         if ($LASTEXITCODE) { throw "Phoenix large-model $workload benchmark failed." }
     }
 }

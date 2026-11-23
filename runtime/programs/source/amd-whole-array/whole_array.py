@@ -150,7 +150,7 @@ def _build_design(
     if compact:
         # Host-packed Q4_0 tiles already follow the BF16 MMUL microtile order.
         # Decode each tile locally before using the same matrix kernel.
-        assert (m,k,n,n_aie_cols,N,r,s) == (64,64,32,4,128,4,8)
+        assert (m,k,n_aie_cols,r,s) == (64,64,4,4,8) and n in (32,64) and N == 4*n
         tile_bytes = m*k*20//32
         A_ty = np.ndarray[(M*K*20//32,), np.dtype[np.uint8]]
         A_l2_ty = np.ndarray[(tile_bytes,), np.dtype[np.uint8]]
@@ -223,7 +223,7 @@ def _build_design(
             of_offsets,
             obj_types=[C_l1_ty] * n_aie_rows,
             names=[f"C_L1L2_{col}_{row}" for row in range(n_aie_rows)],
-            depths=[fifo_depth] * n_aie_rows,
+            depths=[1 if n == 64 else fifo_depth] * n_aie_rows,
         )
         for j in range(n_aie_rows):
             C_l1l2_fifos[j].append(c_tmp_fifos[j])
@@ -635,3 +635,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

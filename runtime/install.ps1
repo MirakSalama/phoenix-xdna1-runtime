@@ -18,9 +18,16 @@ $binaries = @{
     'programs\stream-gemv.xclbin' = 'programs\stream-gemv.xclbin'
 }
 foreach ($shape in $compatibility.prefillPrograms) {
-    if ($shape -notmatch '^[1-9][0-9]*x[1-9][0-9]*x128$') { throw "Invalid prefill shape: $shape" }
+    if ($shape -notmatch '^[1-9][0-9]*x[1-9][0-9]*x(128|256)$') { throw "Invalid prefill shape: $shape" }
     foreach ($extension in @('bin', 'xclbin')) {
         $relative = "programs\prefill-$shape.$extension"
+        $binaries[$relative] = $relative
+    }
+}
+foreach ($shape in $compatibility.residentPrograms) {
+    if ($shape -notmatch '^[1-9][0-9]*x[1-9][0-9]*x(128|256)$') { throw "Invalid resident shape: $shape" }
+    foreach ($extension in @('bin','xclbin')) {
+        $relative = "programs\resident-$shape.$extension"
         $binaries[$relative] = $relative
     }
 }
@@ -86,7 +93,7 @@ try {
     $manifest.version = $version
     $manifest.domains = @('llm')
     $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $manifestPath -Encoding utf8NoBOM
-    '[["en",{"langKey":"en","displayName":"Phoenix XDNA 1 (Windows)","description":"Runs supported GGUF decode matrix-vector operations on the AMD XDNA 1 NPU, with CPU execution for other operations.","releaseNotes":[]}]]' |
+    '[["en",{"langKey":"en","displayName":"Phoenix XDNA 1 (Windows)","description":"Accelerates supported GGUF prompt projections on the AMD XDNA 1 NPU. Split-head mode also shares supported output projections with the CPU during generation.","releaseNotes":[]}]]' |
         Set-Content -LiteralPath (Join-Path $stage 'display-data.json') -Encoding utf8NoBOM
     $artPath = Join-Path $stage 'engine-protocol-server-artifacts.json'
     $artifacts = Get-Content -Raw -LiteralPath $artPath | ConvertFrom-Json

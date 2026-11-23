@@ -51,7 +51,7 @@ bool metadata_op(ggml_op op) {
            op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
-enum class Placement { dense, all, head, split_head };
+enum class Placement { dense, all, head, split_head, prompt_only };
 
 Placement placement() {
     static const Placement configured = [] {
@@ -59,13 +59,14 @@ Placement placement() {
         if (name && std::strcmp(name, "all") == 0) return Placement::all;
         if (name && std::strcmp(name, "head") == 0) return Placement::head;
         if (name && std::strcmp(name, "dense") == 0) return Placement::dense;
+        if (name && std::strcmp(name, "prompt-only") == 0) return Placement::prompt_only;
         return Placement::split_head;
     }();
     return configured;
 }
 
 bool head_mode() {
-    return placement() == Placement::head || placement() == Placement::split_head;
+    return placement() == Placement::head || placement() == Placement::split_head || placement() == Placement::prompt_only;
 }
 
 bool prefill_enabled() {
@@ -89,6 +90,17 @@ bool available_memory(uint64_t free_bytes) {
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) && status.ullTotalPhys >= (uint64_t(16) << 30) &&
            status.ullAvailPhys >= free_bytes;
+}
+
+bool resident_profile() {
+    static const bool selected = [] {
+        const char * enabled = std::getenv("PHOENIX_XDNA_RESIDENT_BF16");
+        const char * budget = std::getenv("PHOENIX_XDNA_PROMPT_CACHE_MIB");
+        return enabled && !std::strcmp(enabled, "1") &&
+               !(budget && (!std::strcmp(budget, "384") || !std::strcmp(budget, "700"))) &&
+               available_memory(uint64_t(8) << 30);
+    }();
+    return selected;
 }
 
 size_t large_prompt_budget(size_t rows, size_t cols) {
@@ -257,6 +269,8 @@ ggml_backend_buffer_type_t host_weights(ggml_backend_dev_t dev) {
 bool useful_shape(const ggml_tensor * weight) {
     const int64_t cols = weight->ne[0], rows = weight->ne[1];
     switch (placement()) {
+        case Placement::prompt_only:
+            return false;
         case Placement::head:
             if (!output_weight(weight) || cols < 128 || cols > 8192 || rows < 512 || rows > 262144) return false;
             return PhoenixMatvec::packed_bytes(rows, cols) <= size_t(256) * 1024 * 1024;
@@ -325,6 +339,25 @@ bool supported(ggml_backend_dev_t dev, const ggml_tensor * op) {
 struct WeightRows {
     const ggml_tensor & weight;
 
+    static void decode_q4_0_x8(const ggml_tensor & weight, size_t index, float * result) {
+        // The pinned CPU repacker stores eight scales, then two 8-byte
+        // groups of signed nibbles per lane. Undo its 0x88 XOR on both nibbles.
+        struct Block { ggml_fp16_t scales[8]; uint8_t quants[128]; };
+        static_assert(sizeof(Block) == 8 * sizeof(block_q4_0));
+        const size_t blocks = static_cast<size_t>(weight.ne[0]) / 32;
+        const auto * row_group = static_cast<const Block *>(weight.data) + (index / 8) * blocks;
+        const size_t lane = index % 8;
+        for (size_t b = 0; b < blocks; ++b) {
+            const auto & block = row_group[b];
+            const float d = ggml_fp16_to_fp32(block.scales[lane]);
+            for (size_t i = 0; i < 16; ++i) {
+                const int v = block.quants[(i / 8) * 64 + lane * 8 + i % 8] ^ 0x88;
+                result[b * 32 + i] = d * ((v & 15) - 8);
+                result[b * 32 + 16 + i] = d * ((v >> 4) - 8);
+            }
+        }
+    }
+
     static void decode(void * source, size_t index, uint16_t * output) {
         auto & self = *static_cast<WeightRows *>(source);
         const auto & weight = self.weight;
@@ -342,7 +375,8 @@ struct WeightRows {
         if (weight.type != GGML_TYPE_F32) {
             thread_local std::vector<float> row;
             row.resize(cols);
-            ggml_get_type_traits(weight.type)->to_float(bytes, row.data(), cols);
+            if (weight.extra && weight.type == GGML_TYPE_Q4_0) decode_q4_0_x8(weight, index, row.data());
+            else ggml_get_type_traits(weight.type)->to_float(bytes, row.data(), cols);
             floats = row.data();
         }
         ggml_fp32_to_bf16_row(floats, reinterpret_cast<ggml_bf16_t *>(output), cols);
@@ -497,12 +531,18 @@ struct Stream {
     WeightCache<PhoenixMatvec> cache;
     WeightCache<PhoenixPrefill> prompt_cache;
     size_t cached_bytes = 0;
-    size_t compact_bytes = 0;
+    size_t q4_cache_bytes = 0;
     unsigned long long hits = 0;
     unsigned long long uploads = 0;
     unsigned long long dispatches = 0;
     unsigned long long prompt_dispatches = 0;
-    std::vector<std::pair<size_t, size_t>> traced_prompt_shapes;
+    struct PromptShape {
+        size_t rows, cols;
+        unsigned long long projections = 0, input_columns = 0, reused_inputs = 0;
+        double elapsed_ms = 0;
+    };
+    std::vector<PromptShape> prompt_shapes;
+    unsigned long long budget_fallbacks = 0;
     double validation_ms = 0;
     double preparation_ms = 0;
     double compute_ms = 0;
@@ -515,7 +555,7 @@ struct Stream {
         const auto start = Clock::now();
         const size_t cols = static_cast<size_t>(weight.ne[0]);
         const size_t bytes = rows * weight.nb[1];
-        const bool compact = std::is_same_v<Engine, PhoenixPrefill> && weight.type == GGML_TYPE_Q4_0 && cols != 960;
+        const bool large_q4 = std::is_same_v<Engine, PhoenixPrefill> && weight.type == GGML_TYPE_Q4_0 && cols != 960;
         const auto * raw = static_cast<const uint8_t *>(weight.data);
         const auto version = weight_version(weight.buffer, raw, bytes);
         auto found = entries.find(raw);
@@ -533,30 +573,37 @@ struct Stream {
             }
             cached_bytes -= entry.cost;
             if constexpr (std::is_same_v<Engine, PhoenixPrefill>) {
-                if (entry.type == GGML_TYPE_Q4_0 && entry.cols != 960) compact_bytes -= entry.cost;
+                if (entry.type == GGML_TYPE_Q4_0 && entry.cols != 960) q4_cache_bytes -= entry.cost;
             }
             entries.erase(found);
         }
         validation_ms += elapsed_ms(start);
         const auto prep_start = Clock::now();
-        const size_t cost = (version.allocation ? 0 : bytes) + Engine::packed_bytes(rows, cols);
+        const size_t snapshot_bytes = version.allocation ? 0 : bytes;
+        const size_t bf16_cost = snapshot_bytes + rows * cols * sizeof(uint16_t);
+        const bool expanded_budget = large_q4 && resident_profile() && available_memory((uint64_t(4) << 30) + bf16_cost);
+        const bool use_bf16 = expanded_budget && PhoenixPrefill::resident_shape(rows, cols);
+        const size_t cost = use_bf16 ? bf16_cost : snapshot_bytes + Engine::packed_bytes(rows, cols);
         constexpr size_t headroom = size_t(68) << 20;
-        size_t resident_limit = (std::max)(size_t(768) << 20, compact_bytes + headroom);
-        if (compact) {
+        size_t resident_limit = (std::max)(size_t(768) << 20, q4_cache_bytes + headroom);
+        if (large_q4) {
             auto budget = large_prompt_budget(rows, cols);
-            if (budget > prompt_budget()) {
+            if (expanded_budget) {
+                budget = size_t(2304) << 20;
+                resident_limit = budget + headroom;
+            } else if (budget > prompt_budget()) {
                 // Recheck before growth. Other model processes may have
                 // consumed RAM after this stream selected its initial profile.
                 if (available_memory(uint64_t(4) << 30)) resident_limit = budget + headroom;
                 else budget = prompt_budget();
             }
-            if (cost > budget || compact_bytes > budget - cost ||
+            if (cost > budget || q4_cache_bytes > budget - cost ||
                 cost > resident_limit || cached_bytes > resident_limit - cost) return {};
         }
         WeightRows input{weight};
         std::shared_ptr<const typename Engine::Prepared> prepared;
         if constexpr (std::is_same_v<Engine, PhoenixPrefill>) {
-            if (compact) prepared = engine.prepare_q4(rows, cols, raw, weight.extra != nullptr);
+            if (large_q4 && !use_bf16) prepared = engine.prepare_q4(rows, cols, raw, weight.extra != nullptr);
         }
         if (!prepared) prepared = engine.prepare(rows, cols, WeightRows::decode, &input);
         if (cost <= resident_limit && cached_bytes <= resident_limit - cost) {
@@ -565,7 +612,7 @@ struct Stream {
             entries.emplace(raw, CachedWeight<Engine>{rows, cols, weight.type, weight.extra != nullptr, cost, version,
                             std::move(snapshot), prepared});
             cached_bytes += cost;
-            if (compact) compact_bytes += cost;
+            if (large_q4) q4_cache_bytes += cost;
         }
         ++uploads;
         preparation_ms += elapsed_ms(prep_start);
@@ -596,6 +643,7 @@ struct Stream {
             ggml_graph_add_node(fallback_graph, op);
             if (ggml_backend_graph_compute(fallback_cpu.get(), fallback_graph) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("CPU prefill fallback failed");
+            ++budget_fallbacks;
             return;
         }
         const auto start = Clock::now();
@@ -604,15 +652,27 @@ struct Stream {
         const double ms = elapsed_ms(start);
         ++dispatches;
         ++prompt_dispatches;
-        const auto shape = std::make_pair(rows, cols);
-        const bool first_shape = std::find(traced_prompt_shapes.begin(), traced_prompt_shapes.end(), shape) == traced_prompt_shapes.end();
-        if (first_shape) traced_prompt_shapes.push_back(shape);
-        if (first_shape || (prompt_dispatches & (prompt_dispatches - 1)) == 0) {
-            char line[512];
-            std::snprintf(line, sizeof(line), "[Phoenix XDNA1] prefill pid=%lu count=%llu tensor=%.*s rows=%zu cols=%zu tokens=%zu type=%s buffer=%s adjacent_shared_input=%d input_reused=%d cached_mib=%zu hits=%llu uploads=%llu validation_ms=%.3f compute_ms=%.3f\n",
+        auto shape = std::find_if(prompt_shapes.begin(), prompt_shapes.end(), [=](const PromptShape & s) {
+            return s.rows == rows && s.cols == cols;
+        });
+        const bool first_shape = shape == prompt_shapes.end();
+        if (first_shape) {
+            prompt_shapes.push_back({rows, cols});
+            shape = prompt_shapes.end() - 1;
+        }
+        ++shape->projections;
+        shape->input_columns += tokens;
+        shape->reused_inputs += reused ? 1 : 0;
+        shape->elapsed_ms += ms;
+        if ((shape->projections & (shape->projections - 1)) == 0 || (prompt_dispatches & (prompt_dispatches - 1)) == 0) {
+            char line[768];
+            const char * storage = PhoenixPrefill::is_resident_bf16(*packed) ? "resident-bf16" :
+                                   (weight.type == GGML_TYPE_Q4_0 && cols != 960 ? "compact-q4" : "bf16");
+            std::snprintf(line, sizeof(line), "[Phoenix XDNA1] prefill pid=%lu count=%llu tensor=%.*s rows=%zu cols=%zu tokens=%zu type=%s storage=%s buffer=%s adjacent_shared_input=%d input_reused=%d cached_mib=%zu hits=%llu uploads=%llu validation_ms=%.3f compute_ms=%.3f shape_projections=%llu shape_columns=%llu shape_reused_inputs=%llu shape_elapsed_ms=%.3f\n",
                           GetCurrentProcessId(), prompt_dispatches, GGML_MAX_NAME, weight.name, rows, cols, tokens,
-                          ggml_type_name(weight.type), weight.buffer ? ggml_backend_buffer_name(weight.buffer) : "none",
-                          int(adjacent_shared_input), int(reused), cached_bytes >> 20, hits, uploads, validation_ms, ms);
+                          ggml_type_name(weight.type), storage, weight.buffer ? ggml_backend_buffer_name(weight.buffer) : "none",
+                          int(adjacent_shared_input), int(reused), cached_bytes >> 20, hits, uploads, validation_ms, ms,
+                          shape->projections, shape->input_columns, shape->reused_inputs, shape->elapsed_ms);
             trace(line);
         }
     }
@@ -697,10 +757,21 @@ ggml_backend_t init_stream(ggml_backend_dev_t device, const char *) {
     api.get_name = [](ggml_backend_t) { return static_cast<const char *>(NAME); };
     api.free = [](ggml_backend_t b) {
         auto * state = static_cast<Stream *>(b->context);
+        const wchar_t * trace_path = _wgetenv(L"PHOENIX_XDNA_TRACE");
+        if (trace_path && *trace_path) {
+            for (const auto & shape : state->prompt_shapes) {
+                char line[320];
+                std::snprintf(line, sizeof(line), "[Phoenix XDNA1] prompt_profile pid=%lu rows=%zu cols=%zu projections=%llu input_columns=%llu reused_inputs=%llu elapsed_ms=%.3f\n",
+                              GetCurrentProcessId(), shape.rows, shape.cols, shape.projections,
+                              shape.input_columns, shape.reused_inputs, shape.elapsed_ms);
+                trace(line);
+            }
+        }
         if (state->dispatches) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "[Phoenix XDNA1] closed pid=%lu dispatches=%llu\n",
-                          GetCurrentProcessId(), state->dispatches);
+            char line[200];
+            std::snprintf(line, sizeof(line), "[Phoenix XDNA1] closed pid=%lu dispatches=%llu prompt_projections=%llu decode_projections=%llu prompt_budget_fallbacks=%llu\n",
+                          GetCurrentProcessId(), state->dispatches, state->prompt_dispatches,
+                          state->dispatches - state->prompt_dispatches, state->budget_fallbacks);
             trace(line);
         } else {
             trace("[Phoenix XDNA1] stream closed with zero completed NPU operations\n");

@@ -11,6 +11,8 @@ public:
     PhoenixPrefill(const PhoenixPrefill&) = delete;
     PhoenixPrefill& operator=(const PhoenixPrefill&) = delete;
     struct Prepared;
+    static bool resident_shape(std::size_t rows, std::size_t columns);
+    static bool is_resident_bf16(const Prepared& weights);
     static bool supports(std::size_t rows, std::size_t columns, std::size_t tokens);
     static std::size_t packed_bytes(std::size_t rows, std::size_t columns);
     static void decode_q5_0_row(const void* packed, std::uint16_t* dst, std::size_t columns);

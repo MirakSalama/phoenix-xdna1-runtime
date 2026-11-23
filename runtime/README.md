@@ -1,10 +1,12 @@
-# Phoenix XDNA 1 for Bionic 0.3.1
+# Phoenix XDNA 1 for Bionic 0.4.0
 
-Phoenix 0.3.1 added compact Q4_0 prompt programs for LFM3-1.7B and Gemma 4 E2B IT. It accepts both the ordinary GGUF representation and Bionic’s AVX2-repacked weights. The NPU expands compact tiles during execution. Windows memory checks and per-stream budgets bound retained weights, with CPU fallback for matrices that would exceed the budget.
+Phoenix 0.4.0 adds 256-token compact prompt programs for five LFM3 and Gemma matrix shapes. On fresh multi-tile inputs it stages the next activation while the NPU processes the current one. The default uses compact four-bit weights, with the CPU and NPU sharing eligible generation work. Optional modes keep more weights expanded in RAM or leave all generation on the CPU.
 
-For a roughly 1,000-token document on a Ryzen 5 8645HS, median warm time to the first visible answer was 5.06 s on LFM3 and 2.90 s on Gemma, versus 8.17 s and 4.32 s on the paired CPU runs. Each warm figure uses four distinct requests on an already loaded instance. A separate generation workload reached 39.67 and 25.89 output tokens/s on Phoenix.
+On a Ryzen 5 8645HS, warm time to the first visible answer on a roughly 1,000-token document was 4.24 s on LFM3-1.7B and 2.52 s on Gemma 4 E2B IT. The paired stock CPU times were 7.93 s and 3.85 s. Radeon 760M Vulkan returned answers in 0.94 s and 0.55 s on the same task. Reported warm medians use four different requests after the first on a loaded model.
 
-All ten document replies matched CPU exactly. Across all 70 paired replies, one LFM3 city-name response returned the right city with extra markup. The verifier exposes this difference under strict comparison and supports a narrow equivalent-city option.
+A separate Gemma Q4_0 prompt-only benchmark reached 557 input tokens/s at 512 tokens against 362 on the bracketing CPU runs. All ten Bionic document responses matched CPU text and token counts. Across the 70-pair default suite, 69 matched exactly. One LFM3 response repeated the correct city with extra markup. Ordinary GGUF compatibility follows the base runtime. Acceleration depends on model shapes, batch and quantization.
+
+Use `.\set-mode.ps1 -Mode prompt-only` to keep generation on the CPU, or `.\set-mode.ps1 -Mode split-head` to restore the default. Use `-ResidentBF16` to opt into expanded weights when memory permits, and `-Compact` to restore compact storage. Reload the model after changing a setting.
 
 ## Install
 
@@ -14,10 +16,10 @@ Extract the ZIP to a new directory. In PowerShell 7, run the following from that
 
 ```powershell
 .\install.ps1
-lms runtime select phoenix-xdna1-win-x86_64-avx2@0.3.1
+lms runtime select phoenix-xdna1-win-x86_64-avx2@0.4.0
 ```
 
-Alternatively select **Phoenix XDNA 1 (Windows) 0.3.1** in Bionic's GGUF runtime settings. Unload and reload the model. To roll back, select the previous engine and reload the model.
+Alternatively select **Phoenix XDNA 1 (Windows) 0.4.0** in Bionic's GGUF runtime settings. Unload and reload the model. To roll back, select the previous engine and reload the model.
 
 ## Verify and build
 

@@ -23,3 +23,9 @@ if (!$devShell) { throw 'Visual Studio with the C++ build tools is required.' }
 if ($LASTEXITCODE) { throw "GEMV program build failed with exit code $LASTEXITCODE." }
 & "$python/python.exe" "$PSScriptRoot/prefill_gemm.py" $Output
 if ($LASTEXITCODE) { throw "Prefill GEMM program build failed with exit code $LASTEXITCODE." }
+& "$python/python.exe" "$PSScriptRoot/prefill_gemm.py" $Output --tokens 256
+if ($LASTEXITCODE) { throw "Wide prefill GEMM program build failed with exit code $LASTEXITCODE." }
+foreach ($tokens in @(128,256)) {
+    & "$python/python.exe" "$PSScriptRoot/prefill_gemm.py" $Output --tokens $tokens --resident
+    if ($LASTEXITCODE) { throw "Resident BF16 program build failed at $tokens tokens." }
+}

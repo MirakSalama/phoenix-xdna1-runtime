@@ -158,13 +158,20 @@ def measure_model(key, stats, trace, port, warm_runs):
     ident = "phoenix-perf-" + uuid4().hex[:10]
     entry = {"model": key, "requests": []}
     stats["models"].append(entry)
+    offset = trace.stat().st_size if trace else 0
     try:
         start = time.perf_counter()
         lms("load", key, "--identifier", ident, "--context-length", str(stats["context_length"]), "--parallel", "1",
             "--ttl", "300", "--yes", timeout=200)
         entry["load_seconds"] = time.perf_counter() - start
         entry["instance"] = next(m for m in loaded_models() if m.get("identifier") == ident)
-        offset = trace.stat().st_size if trace else 0
+        startup, offset = read_trace(trace, offset)
+        routes = {line.rsplit("=", 1)[1] for line in startup if line.startswith("[Phoenix XDNA1] decode_device=")}
+        if len(routes) > 1 or routes - {"cpu", "npu-enabled"}:
+            raise RuntimeError(f"Invalid decode device while loading {key!r}")
+        entry["decode_device"] = next(iter(routes), None)
+        if routes and stats.get("placement") and (entry["decode_device"] == "cpu") != (stats["placement"] == "prompt-only"):
+            raise RuntimeError(f"Phoenix selected a different decode device than requested for {key!r}")
         long_prompt = is_document_workload(stats["workload"])
         for i in range(warm_runs + 1):
             question = prefill_prompt(stats["workload"], i) if long_prompt else stats["prompt"]
@@ -195,8 +202,11 @@ def measure_model(key, stats, trace, port, warm_runs):
                r["stats"]["total_output_tokens"] != comparable[0]["stats"]["total_output_tokens"]
                for r in comparable):
             raise RuntimeError(f"Outputs diverged on repeated {key!r} requests")
-        if trace and not long_prompt and not any("dispatch" in line.lower()
-                             for r in entry["requests"] for line in r["hardware_trace"]):
+        decoded_on_npu = any(" dispatch pid=" in line for r in entry["requests"] for line in r["hardware_trace"])
+        cpu_decode = entry["decode_device"] == "cpu" if routes else stats.get("placement") == "prompt-only"
+        if trace and cpu_decode and decoded_on_npu:
+            raise RuntimeError(f"Unexpected NPU decode in prompt-only mode on {key!r}")
+        if trace and not cpu_decode and not long_prompt and not decoded_on_npu:
             raise RuntimeError(f"No NPU dispatch was recorded during replies from {key!r}")
         if long_prompt and stats["prefill"] and key in stats["required_prefill_models"]:
             if not any("prefill" in line.lower() and "tensor=" in line.lower()
@@ -294,7 +304,7 @@ def main():
     parser.add_argument("--enable-prefill", action="store_true", help="Enable CPU/NPU prompt processing in the prefill benchmark")
     parser.add_argument("--full-answer", action="store_true", help="Generate the full city answer for each long prompt")
     parser.add_argument("--require-prefill-on", action="append", help="Require a hardware prefill trace on this model")
-    parser.add_argument("--placement", choices=["all", "dense", "head", "split-head"],
+    parser.add_argument("--placement", choices=["all", "dense", "head", "split-head", "prompt-only"],
                         help="Request a hardware placement while the diagnostic trace is active")
     parser.add_argument("--head-tiles", type=int, choices=range(1, 33), metavar="1..32",
                         help="Set the number of NPU tiles for split-head profiling")

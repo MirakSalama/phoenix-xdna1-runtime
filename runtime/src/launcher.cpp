@@ -24,6 +24,14 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const auto directory = std::filesystem::path(executable).parent_path();
+        const DWORD storage_flags = GetFileAttributesW((directory / L"phoenix-resident-bf16").c_str());
+        if (!std::getenv("PHOENIX_XDNA_RESIDENT_BF16") && storage_flags != INVALID_FILE_ATTRIBUTES &&
+            (storage_flags & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
+            _putenv_s("PHOENIX_XDNA_RESIDENT_BF16", "1") != 0) return 1;
+        const DWORD mode_flags = GetFileAttributesW((directory / L"phoenix-prompt-only").c_str());
+        if (!std::getenv("PHOENIX_XDNA_PLACEMENT") && mode_flags != INVALID_FILE_ATTRIBUTES &&
+            (mode_flags & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0 &&
+            _putenv_s("PHOENIX_XDNA_PLACEMENT", "prompt-only") != 0) return 1;
         const auto trace_file = directory / L"dispatch-test.log";
         const DWORD flags = GetFileAttributesW(trace_file.c_str());
         if (flags != INVALID_FILE_ATTRIBUTES &&
@@ -35,7 +43,7 @@ int main(int argc, char ** argv) {
             for (int i = 0; i < 4 && input.getline(header, sizeof header); ++i) {
                 const std::string line(header);
                 if (line.rfind("placement=", 0) == 0) {
-                    for (const char * mode : {"all", "dense", "head", "split-head"}) {
+                    for (const char * mode : {"all", "dense", "head", "split-head", "prompt-only"}) {
                         if (line.substr(10) == mode && _putenv_s("PHOENIX_XDNA_PLACEMENT", mode) != 0) return 1;
                     }
                 } else if (line.rfind("tiles=", 0) == 0) {
@@ -48,6 +56,12 @@ int main(int argc, char ** argv) {
                     if (_putenv_s("PHOENIX_XDNA_PREFILL", header + 8) != 0) return 1;
                 } else break;
             }
+            input.close();
+            const char * mode = std::getenv("PHOENIX_XDNA_PLACEMENT");
+            std::ofstream output(trace_file, std::ios::binary | std::ios::app);
+            output << "[Phoenix XDNA1] decode_device=" << (mode && !std::strcmp(mode, "prompt-only") ? "cpu" : "npu-enabled") << '\n';
+            output.close();
+            if (!output) return 1;
             if (!_wgetenv(L"PHOENIX_XDNA_TRACE") && _wputenv_s(L"PHOENIX_XDNA_TRACE", trace_file.c_str()) != 0) {
                 std::fprintf(stderr, "Phoenix XDNA1: failed to enable the dispatch trace.\n");
                 return 1;

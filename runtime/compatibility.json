@@ -1,6 +1,6 @@
 {
   "pack": "phoenix-xdna1-win-x86_64-avx2",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "basePack": "llama.cpp-win-x86_64-avx2",
   "baseVersion": "2.80.1",
   "llamaRevision": "29b52d398",
@@ -10,7 +10,12 @@
     "6144x1536x128",
     "12288x1536x128",
     "1536x6144x128",
-    "2048x7680x128"
+    "2048x7680x128",
+    "7680x2048x256",
+    "6144x1536x256",
+    "12288x1536x256",
+    "1536x6144x256",
+    "2048x7680x256"
   ],
   "nativeHashes": {
     "ggml-base.dll": "B3C7555601B62248F22413135CBC29B81613176D32DC2CA4C4DBBA6D4E36F410",
@@ -24,5 +29,15 @@
     "liblmstudio_bindings.node": "17C6656E2B8539F741A5D434221749774B3434D550D481B564E4FA7D3A31EA34",
     "lmstudiocore.dll": "C0553FF1DB34CCFF92F1B3EA5C8F4B1E9B2E24C38EE46297510FDEB8A4018D6E",
     "mtmd.dll": "8C03EDF07A727905AFEAE3D2824FABF709B9F7E7DEA616F3F1374D5237274A15"
-  }
+  },
+  "residentPrograms": [
+    "7680x2048x128",
+    "7680x2048x256",
+    "6144x1536x128",
+    "6144x1536x256",
+    "12288x1536x128",
+    "12288x1536x256",
+    "1536x6144x128",
+    "1536x6144x256"
+  ]
 }
