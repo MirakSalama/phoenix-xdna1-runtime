@@ -2,6 +2,12 @@
 
 The versions below are separately installable Windows runtime packs. Each tag pins the matching `runtime/` source snapshot. The table of releases on GitHub includes subsequent stable versions. [All releases](https://github.com/MirakSalama/phoenix-xdna1-runtime/releases)
 
+## 0.5.0
+
+- Added one-command 16-core XDNA 1 scoring for the first 3,072 rows of supported 5,120-wide Q1_0 output heads. Bonsai uses its original packed GGUF weights. The native slice takes 2.11 MiB of device weight storage. A standalone 40-call trial on a Ryzen 5 8645HS measured a 0.764 ms median for this operation.
+- Added selectable Radeon transformer layers with a split CPU/XDNA head, an expanded-BF16 comparison, prompt-gate placement and a Radeon-only control. CPU and XDNA remain the default placement. Reload a model after switching modes.
+- Pinned Bionic Vulkan llama.cpp 2.80.1 and Phoenix 0.4.0 inputs. The pack includes kernel source, a clean-build verifier and exact device payload digests. [0.5.0 release](https://github.com/MirakSalama/phoenix-xdna1-runtime/releases/tag/v0.5.0)
+
 ## 0.4.0
 
 - Added 256-token prompt tiles for five LFM3 and Gemma projection shapes. Input staging can overlap the preceding tile’s NPU execution.

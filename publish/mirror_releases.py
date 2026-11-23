@@ -91,12 +91,13 @@ def discover(experiments):
         entries = manifest_entries(manifest)
         if "install.ps1" not in entries:
             continue
-        if "compatibility.json" in entries:
-            lock_data = checked_path(folder, "compatibility.json").read_bytes()
-            if sha256(lock_data) != entries["compatibility.json"]:
+        lock_name = "runtime-lock.json" if "runtime-lock.json" in entries else "compatibility.json"
+        if lock_name in entries:
+            lock_data = checked_path(folder, lock_name).read_bytes()
+            if sha256(lock_data) != entries[lock_name]:
                 fail(f"Changed compatibility lock in {folder.name}")
             lock = json.loads(lock_data)
-            if lock.get("pack") != PACK:
+            if lock.get("name" if lock_name == "runtime-lock.json" else "pack") != PACK:
                 continue
             version = lock.get("version")
         elif folder.name == "027_bionic_xdna1":

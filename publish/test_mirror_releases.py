@@ -18,6 +18,25 @@ class LocalMirror(unittest.TestCase):
         (self.tree / "README.md").write_bytes(b"verified\r\n")
         self.expected = mirror.expected_tree(self.tree)
 
+    def test_successor_discovery_skips_preview_and_rejects_changed_lock(self):
+        def make_candidate(index, name):
+            folder = self.root / f"{index}_bionic_xdna1_release"
+            folder.mkdir()
+            inputs = {"runtime-lock.json": json.dumps({"name": name, "version": "0.5.0"}).encode(),
+                      "install.ps1": b"Write-Output installed\n"}
+            for part, data in inputs.items():
+                (folder / part).write_bytes(data)
+            (folder / mirror.MANIFEST).write_bytes(
+                "".join(f"{mirror.sha256(data)}  {part}\n" for part, data in inputs.items()).encode())
+            return folder
+
+        make_candidate("034", "phoenix-bonsai-preview-win-x86_64-avx2")
+        canonical = make_candidate("035", mirror.PACK)
+        self.assertEqual(mirror.discover(self.root), {"0.5.0": canonical})
+        (canonical / "runtime-lock.json").write_bytes(b"{}")
+        with self.assertRaisesRegex(mirror.MirrorError, "Changed compatibility lock"):
+            mirror.discover(self.root)
+
     def test_publish_version_preserves_root_and_history(self):
         origin, project = self.root/"origin.git", self.root/"private-clone"
         mirror.git("init","--bare","--initial-branch=main",str(origin))

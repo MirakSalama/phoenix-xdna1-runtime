@@ -160,7 +160,25 @@ def sanitize(source, root, notes_path):
         raise ValueError("Expected a Phoenix-XDNA1-X.Y.Z.zip archive")
     version = match[1]
     raw = read_verified(source)
-    if "compatibility.json" in raw:
+    successor = "runtime-lock.json" in raw
+    if successor:
+        lock = json.loads(raw["runtime-lock.json"])
+        if (lock.get("name"), lock.get("version")) != (PACK, version) or any(
+                name not in lock for name in ("vulkan", "phoenix", "vulkanFiles", "phoenixFiles", "payloadFiles")):
+            raise ValueError("Incompatible successor identity")
+        base, revision = lock["llamaBaseVersion"], lock["llamaRevision"]
+        if (not re.fullmatch(VERSION, base) or not re.fullmatch(r"[0-9a-f]{7,40}", revision)
+                or lock["vulkan"] != f"llama.cpp-win-x86_64-vulkan-avx2-{base}"
+                or not re.fullmatch(r"phoenix-xdna1-win-x86_64-avx2-" + VERSION, lock["phoenix"])):
+            raise ValueError("Unexpected successor build identity or dependencies")
+        payload = {"llama-server.exe": "build/phoenix-hybrid.exe", "ggml-phoenix.dll": "build/ggml-phoenix.dll",
+                   "programs/bonsai-q1-3072x5120.xclbin": "programs/bonsai-q1-3072x5120.xclbin",
+                   "programs/bonsai-q1-3072x5120.bin": "programs/bonsai-q1-3072x5120.bin"}
+        if set(lock["payloadFiles"]) != set(payload) or any(
+                name not in raw or digest(raw[name]) != lock["payloadFiles"][dest].lower()
+                for dest, name in payload.items()):
+            raise ValueError("Packaged native code does not match the installer's payload lock")
+    elif "compatibility.json" in raw:
         lock = json.loads(raw["compatibility.json"])
         if lock["version"] != version or lock["pack"] != PACK or lock["basePack"] != "llama.cpp-win-x86_64-avx2":
             raise ValueError("Incompatible release identity")
@@ -175,28 +193,46 @@ def sanitize(source, root, notes_path):
     for name, data in raw.items():
         if name == "README.md" or name.startswith("results/"):
             continue
-        kind = payload_type(name)
+        if successor and (name in {"runtime-lock.json", "remove.ps1", "update-build-lock.ps1",
+                                   "programs/source/provenance.json", "THIRD_PARTY_NOTICES.md"} or
+                          name in {"licenses/aie-api-MIT.txt", "licenses/ryzen-ai-npu-lab-MIT.txt",
+                                   "licenses/xrt-sdk-LICENSE.txt"}):
+            kind = "source"
+        elif successor and name in payload.values():
+            kind = "device" if name.startswith("programs/") else "native"
+        else:
+            kind = payload_type(name)
         if kind == "native" and not data.startswith(b"MZ"):
             raise ValueError(f"Invalid Phoenix host program: {name}")
         if kind == "device" and name.endswith(".xclbin") and not data.startswith(b"xclbin2"):
             raise ValueError(f"Invalid device image: {name}")
-        if kind == "source":
+        if kind == "source" and not successor:
             data = portable_source(name, data)
         screen(name, data, kind != "source")
         contents[name] = data
     required = {"build/phoenix-server.exe", "build/ggml-phoenix.dll", "src/ggml-phoenix.cpp",
                 "install.ps1", "build.ps1", "vendor/ggml/LICENSE", "programs/Apache-2.0.txt",
                 "programs/LLVM-exception.txt"}
+    if successor:
+        required.remove("build/phoenix-server.exe")
+        required.update(payload.values())
+        required.update({"runtime-lock.json", "set-mode.ps1", "update-build-lock.ps1", "remove.ps1",
+                         "THIRD_PARTY_NOTICES.md", "src/hybrid.cpp", "src/phoenix_matvec.cpp", "programs/source/bonsai_q1.py",
+                         "programs/source/build-programs.ps1", "programs/source/bonsai_q1.cc",
+                         "programs/source/bonsai_q1_vec.cc", "programs/source/provenance.json", "programs/source/verify.py"})
     if not required <= contents.keys():
         raise ValueError("Missing required runtime files or license notices")
     default_notes = Path(__file__).with_name("notes") / (version + ".md")
     notes = (notes_path.read_text(encoding="utf8") if notes_path else
              default_notes.read_text(encoding="utf8") if default_notes.exists() else "")
-    contents["README.md"] = readme(version, base, raw, notes)
-    contents["THIRD_PARTY_NOTICES.md"] = NOTICES.format(rev=revision).encode("utf8")
+    contents["README.md"] = raw["README.md"] if successor else readme(version, base, raw, notes)
+    if not successor:
+        contents["THIRD_PARTY_NOTICES.md"] = NOTICES.format(rev=revision).encode("utf8")
     for notice in ("aie-api-MIT.txt", "ryzen-ai-npu-lab-MIT.txt", "xrt-sdk-LICENSE.txt"):
         data = (Path(__file__).with_name("notices") / notice).read_bytes()
         screen(notice, data, False)
+        if successor and contents.get("licenses/" + notice) != data:
+            raise ValueError(f"Successor package has an unrecognized license notice: {notice}")
         contents["licenses/" + notice] = data
     for name in ("README.md","THIRD_PARTY_NOTICES.md"):
         screen(name, contents[name], False)
