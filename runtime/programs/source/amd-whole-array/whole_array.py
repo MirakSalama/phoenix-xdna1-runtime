@@ -19,11 +19,13 @@ The script has two modes:
 
 import argparse
 import sys
+from pathlib import Path
 
 import aie.iron as iron
 import numpy as np
-from aie.helpers.taplib import TensorAccessSequence, TensorTiler2D
+from aie.helpers.taplib import TensorAccessPattern, TensorAccessSequence, TensorTiler2D
 from aie.iron import (
+    Buffer,
     CompileTime,
     In,
     ObjectFifo,
@@ -37,6 +39,8 @@ from aie.iron import (
     str_to_dtype,
 )
 from aie.iron.controlflow import range_
+from aie.iron.kernel import ExternalFunction
+from aie.utils import config
 from aie.iron.device import NPU2, from_name
 from aie.utils.benchmark import run_iters
 from aie.utils.hostruntime.argparse import add_benchmark_args, add_compile_args
@@ -69,6 +73,7 @@ def _build_design(
     scalar,
     *,
     generate_taps=False,
+    compact=False,
 ):
     """Build the whole-array matmul IRON design and resolve to MLIR."""
     dev_str = "npu2" if isinstance(dev, NPU2) else "npu"
@@ -142,6 +147,18 @@ def _build_design(
     A_l1_ty = np.ndarray[(m, k), np.dtype[dtype_in]]
     B_l1_ty = np.ndarray[(k, n), np.dtype[dtype_in]]
     C_l1_ty = np.ndarray[(m, n), np.dtype[dtype_out]]
+    if compact:
+        # Host-packed Q4_0 tiles already follow the BF16 MMUL microtile order.
+        # Decode each tile locally before using the same matrix kernel.
+        assert (m,k,n,n_aie_cols,N,r,s) == (64,64,32,4,128,4,8)
+        tile_bytes = m*k*20//32
+        A_ty = np.ndarray[(M*K*20//32,), np.dtype[np.uint8]]
+        A_l2_ty = np.ndarray[(tile_bytes,), np.dtype[np.uint8]]
+        A_l1_ty = A_l2_ty
+        decoded = np.ndarray[(m*k,), np.dtype[dtype_in]]
+        expand = ExternalFunction("phoenix_expand_q4",
+            source_file=str(Path(__file__).resolve().parent.parent / "expand_q4.cc"),
+            arg_types=[A_l1_ty,decoded], include_dirs=[config.cxx_header_path()])
 
     A_l3l2_fifos: list[ObjectFifo] = []
     A_l2l1_fifos: list[ObjectFifo] = []
@@ -168,7 +185,7 @@ def _build_design(
             of_offsets,
             obj_types=[A_l1_ty] * (stop_row - start_row),
             names=[f"A_L2L1_{row}" for row in range(start_row, stop_row)],
-            dims_to_stream=a_dims,
+            dims_to_stream=None if compact else a_dims,
         )
         A_l2l1_fifos.extend(a_tmp_fifos)
 
@@ -211,7 +228,11 @@ def _build_design(
         for j in range(n_aie_rows):
             C_l1l2_fifos[j].append(c_tmp_fifos[j])
 
-    def core_fn(in_a, in_b, out_c, zero, matmul):
+    def core_fn(in_a, in_b, out_c, *args):
+        if compact:
+            temp_a, unpack, zero, matmul = args
+        else:
+            zero, matmul = args
         loop = range(1)  # Workaround for issue #1547
         if n_tiles_per_core > 1:
             loop = range_(n_tiles_per_core)
@@ -222,7 +243,11 @@ def _build_design(
             for _ in range_(K // k):
                 elem_in_a = in_a.acquire(1)
                 elem_in_b = in_b.acquire(1)
-                matmul(elem_in_a, elem_in_b, elem_out)
+                if compact:
+                    unpack(elem_in_a, temp_a)
+                    matmul(temp_a, elem_in_b, elem_out)
+                else:
+                    matmul(elem_in_a, elem_in_b, elem_out)
                 in_a.release(1)
                 in_b.release(1)
             out_c.release(1)
@@ -236,6 +261,7 @@ def _build_design(
                 A_l2l1_fifos[row].cons(),
                 B_l2l1_fifos[col].cons(),
                 C_l1l2_fifos[row][col].prod(),
+                *([Buffer(decoded, name=f"unpacked_{row}_{col}"), expand] if compact else []),
                 zero_kernel,
                 matmul_kernel,
             ],
@@ -246,13 +272,18 @@ def _build_design(
     tb_max_n_rows = 4 if not c_col_maj else 2
     tb_n_rows = tb_max_n_rows // 2
 
-    A_tiles = TensorTiler2D.group_tiler(
-        (M, K),
-        (m * n_A_tiles_per_shim, k),
-        (1, K // k),
-        pattern_repeat=N // n // n_aie_cols,
-        prune_step=False,
-    )
+    if compact:
+        slab = (K//k)*tile_bytes
+        A_tiles = [TensorAccessPattern((M*K*20//32,), group*slab, [1,1,1,slab], [0,0,0,1])
+                   for group in range(M//m)]
+    else:
+        A_tiles = TensorTiler2D.group_tiler(
+            (M, K),
+            (m * n_A_tiles_per_shim, k),
+            (1, K // k),
+            pattern_repeat=N // n // n_aie_cols,
+            prune_step=False,
+        )
     if b_col_maj:
         B_tiles = TensorTiler2D.step_tiler(
             (N, K),

@@ -62,6 +62,8 @@ try {
             if ($LASTEXITCODE) { throw 'Building the scheduler differential test failed.' }
             & cl.exe @flags "/I$src" "/I$internals" (Join-Path $root 'tests\ggml_prefill_smoke.cpp') /link $base $cpu $registry "/out:$build\ggml-prefill-test.exe"
             if ($LASTEXITCODE) { throw 'Building the GGUF prompt test failed.' }
+            & cl.exe @flags "/I$src" "/I$internals" "/I$XrtSdk\include" (Join-Path $root 'tests\prefill_regression.cpp') (Join-Path $src 'phoenix_prefill.cpp') /link $base $cpu (Join-Path $XrtSdk 'lib\xrt_coreutil.lib') "/out:$build\prefill-regression.exe"
+            if ($LASTEXITCODE) { throw 'Building the prefill activation and packing regression failed.' }
         }
     }
 } finally {

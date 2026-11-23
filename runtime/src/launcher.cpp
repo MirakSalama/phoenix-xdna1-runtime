@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 
 #include <cstdio>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -37,8 +38,12 @@ int main(int argc, char ** argv) {
                     for (const char * mode : {"all", "dense", "head", "split-head"}) {
                         if (line.substr(10) == mode && _putenv_s("PHOENIX_XDNA_PLACEMENT", mode) != 0) return 1;
                     }
-                } else if (line.size() == 7 && line.rfind("tiles=", 0) == 0 && header[6] >= '1' && header[6] <= '8') {
-                    if (_putenv_s("PHOENIX_XDNA_HEAD_TILES", header + 6) != 0) return 1;
+                } else if (line.rfind("tiles=", 0) == 0) {
+                    int tiles = 0;
+                    const char * end = header + line.size();
+                    const auto parsed = std::from_chars(header + 6, end, tiles);
+                    if (parsed.ec == std::errc{} && parsed.ptr == end && tiles >= 1 && tiles <= 32 &&
+                        _putenv_s("PHOENIX_XDNA_HEAD_TILES", header + 6) != 0) return 1;
                 } else if (line == "prefill=1" || line == "prefill=0") {
                     if (_putenv_s("PHOENIX_XDNA_PREFILL", header + 8) != 0) return 1;
                 } else break;

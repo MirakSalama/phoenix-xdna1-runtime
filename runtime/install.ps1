@@ -16,8 +16,13 @@ $binaries = @{
     'llama-server.exe' = 'build\phoenix-server.exe'
     'ggml-phoenix.dll' = 'build\ggml-phoenix.dll'
     'programs\stream-gemv.xclbin' = 'programs\stream-gemv.xclbin'
-    'programs\prefill-2560x960x128.bin' = 'programs\prefill-2560x960x128.bin'
-    'programs\prefill-2560x960x128.xclbin' = 'programs\prefill-2560x960x128.xclbin'
+}
+foreach ($shape in $compatibility.prefillPrograms) {
+    if ($shape -notmatch '^[1-9][0-9]*x[1-9][0-9]*x128$') { throw "Invalid prefill shape: $shape" }
+    foreach ($extension in @('bin', 'xclbin')) {
+        $relative = "programs\prefill-$shape.$extension"
+        $binaries[$relative] = $relative
+    }
 }
 foreach ($rows in @(128,256,384,512,768,1024,1536,2048,2560,3072,4096,6144,8192,16384,32768,49152,65536)) {
     $relative = "programs\stream-$rows.bin"

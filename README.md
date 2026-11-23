@@ -1,9 +1,9 @@
-# Phoenix XDNA 1 v0.2.0 — Cached weights and shared CPU/NPU generation
+# Phoenix XDNA 1 v0.3.1 — Compact four-bit prompts for LFM3 and Gemma 4
 
-Phoenix now caches the weights it prepares from your GGUF. An eight-core streaming kernel processes eligible vocabulary rows while the CPU computes the remaining rows. Long enough SmolLM2 prompts can also use the NPU for selected feed-forward operations.
+Phoenix adds compact four-bit prompt processing for **LFM3-1.7B QAD Q4_0** and **Gemma 4 E2B IT Q4_0**. The runtime keeps the GGUF’s block scales and expands eligible weight tiles on the NPU. It recognizes Bionic’s AVX2-repacked weights and bounds the memory retained per model stream.
 
-On the same warm eight-token reply used to compare the two packs, LFM2.5-230M rose from **3.23 to 186.30 output tokens/s**, and SmolLM2-360M from **1.39 to 98.81**. These are whole-runtime generation rates measured against version 0.1.0. Stock CPU reached 214.63 and 112.75 tokens/s on that task. On a 266–267-token SmolLM2 prompt, Phoenix delivered the first warm token in 595 ms versus 799 ms on CPU. The first request after loading took 911 ms versus 876 ms on CPU.
+On a Ryzen 5 8645HS, a roughly 1,000-token document reached its first visible answer in **5.06 seconds on LFM3** and **2.90 on Gemma**, compared with **8.17** and **4.32** on stock CPU. These are medians of four distinct requests after the first request on a loaded model. All ten document replies matched CPU text and token counts. Across all 70 comparisons, one LFM3 city answer repeated the correct city with extra markup.
 
-The installer checks the local Bionic CPU pack and stages the version separately. The verification harness compares CPU and Phoenix replies in Bionic and checks for completed NPU operations. Extract the runtime ZIP in **Assets**, run `.\install.ps1` and select **Phoenix XDNA 1 (Windows) 0.2.0**. [Versioned source and setup](https://github.com/MirakSalama/phoenix-xdna1-runtime/tree/v0.2.0/runtime)
+Extract the runtime ZIP in **Assets**, run `.\install.ps1` and select **Phoenix XDNA 1 (Windows) 0.3.1**. Bionic’s Windows CPU llama.cpp 2.80.1 pack and a working XDNA 1 XRT driver are required. [Versioned source, limits and verification](https://github.com/MirakSalama/phoenix-xdna1-runtime/tree/v0.3.1/runtime)
 
-[Download the Windows runtime ZIP](https://github.com/MirakSalama/phoenix-xdna1-runtime/releases/download/v0.2.0/Phoenix-XDNA1-0.2.0.zip) · [Runtime sources and installation](runtime/README.md) · [Third-party notices](runtime/THIRD_PARTY_NOTICES.md)
+[Download the Windows runtime ZIP](https://github.com/MirakSalama/phoenix-xdna1-runtime/releases/download/v0.3.1/Phoenix-XDNA1-0.3.1.zip) · [Runtime sources and installation](runtime/README.md) · [Third-party notices](runtime/THIRD_PARTY_NOTICES.md)

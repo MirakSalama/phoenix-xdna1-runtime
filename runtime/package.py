@@ -16,11 +16,13 @@ def main():
         parser.error("output already exists")
     names = {"package.py", "README.md", "install.ps1", "build.ps1", "verify.ps1", "compatibility.json",
              "build/phoenix-server.exe", "build/ggml-phoenix.dll", "build/ggml-matvec-test.exe",
-             "build/ggml-prefill-test.exe", "programs/stream-gemv.xclbin", "programs/prefill-2560x960x128.bin",
-             "programs/prefill-2560x960x128.xclbin", "programs/Apache-2.0.txt", "programs/LLVM-exception.txt",
+             "build/ggml-prefill-test.exe", "build/prefill-regression.exe", "programs/stream-gemv.xclbin",
+             "programs/Apache-2.0.txt", "programs/LLVM-exception.txt",
              "vendor/ggml/LICENSE", "vendor/ggml/src/ggml-backend-impl.h", "vendor/ggml/src/ggml-common.h",
              "vendor/ggml/src/ggml-quants.h", "vendor/ggml/include/ggml.h", "vendor/ggml/include/gguf.h",
              "vendor/ggml/include/ggml-alloc.h", "vendor/ggml/include/ggml-cpu.h", "vendor/ggml/include/ggml-backend.h"}
+    names.update(f"programs/prefill-{shape}.{extension}" for shape in lock["prefillPrograms"]
+                 for extension in ("bin", "xclbin"))
     for pattern in ("src/*.cpp", "src/*.h", "tests/*.cpp", "tests/*.py", "programs/stream-*.bin",
                     "programs/source/**/*.cc", "programs/source/**/*.h", "programs/source/**/*.py",
                     "programs/source/**/*.ps1", "programs/source/**/LICENSE", "THIRD_PARTY_NOTICES.md"):

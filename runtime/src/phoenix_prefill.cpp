@@ -1,5 +1,8 @@
 #include "phoenix_prefill.h"
+#include "phoenix_q4_prompt.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-quants.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -11,19 +14,22 @@
 #include <xrt/xrt_kernel.h>
 #include <xrt/experimental/xrt_xclbin.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <immintrin.h>
+#include <list>
 #include <stdexcept>
 #include <vector>
 
 namespace {
-constexpr size_t output_width = 2560;
-constexpr size_t input_width = 960;
 constexpr size_t block = 128;
+constexpr size_t input_slots = 4;
 
-std::filesystem::path program_path() {
+std::filesystem::path program_path(size_t rows, size_t columns) {
     static const char address = 0;
     HMODULE module{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -32,7 +38,8 @@ std::filesystem::path program_path() {
     const auto n = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
     if (!n || n >= path.size()) throw std::runtime_error("Prefill module path unavailable");
     path.resize(n);
-    return std::filesystem::path(path).parent_path() / "programs" / "prefill-2560x960x128";
+    return std::filesystem::path(path).parent_path() / "programs" /
+           ("prefill-"+std::to_string(rows)+"x"+std::to_string(columns)+"x128");
 }
 
 std::vector<char> read_file(std::filesystem::path path, const wchar_t* extension) {
@@ -48,24 +55,27 @@ std::vector<char> read_file(std::filesystem::path path, const wchar_t* extension
 }
 
 struct PhoenixPrefill::Prepared {
+    size_t rows, columns;
     xrt::bo weights;
 };
 
-struct PhoenixPrefill::Impl {
-    xrt::device device{0};
+namespace {
+struct ProjectionProgram {
+    xrt::device& device;
+    const size_t input_width;
     xrt::xclbin image;
     xrt::hw_context context;
     xrt::kernel kernel;
-    xrt::bo instructions, x, y;
+    xrt::bo instructions, y;
+    std::array<xrt::bo, input_slots> inputs;
     xrt::run run;
-    ggml_bf16_t* input;
     float* result;
+    std::vector<float> previous_input, rounded;
+    std::vector<uint8_t> codes;
+    ggml_type staged_type = GGML_TYPE_COUNT;
 
-    Impl() {
-        const auto name = device.get_info<xrt::info::device::name>();
-        if (name.find("Phoenix") == std::string::npos && name.find("Hawk") == std::string::npos)
-            throw std::runtime_error("Unsupported Phoenix prefill device");
-        const auto stem = program_path();
+    ProjectionProgram(xrt::device& dev, size_t rows, size_t columns) : device(dev), input_width(columns) {
+        const auto stem = program_path(rows, columns);
         image = xrt::xclbin(read_file(stem, L".xclbin"));
         device.register_xclbin(image);
         context = xrt::hw_context(device, image.get_uuid());
@@ -75,18 +85,119 @@ struct PhoenixPrefill::Impl {
         instructions = xrt::bo(device, code.size(), xrt::bo::flags::cacheable, kernel.group_id(1));
         instructions.write(code.data(), code.size(), 0);
         instructions.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        x = xrt::bo(device, block*input_width*sizeof(ggml_bf16_t), xrt::bo::flags::host_only, 0);
-        y = xrt::bo(device, block*output_width*sizeof(float), xrt::bo::flags::host_only, 0);
-        input = x.map<ggml_bf16_t*>();
+        y = xrt::bo(device, block*rows*sizeof(float), xrt::bo::flags::host_only, 0);
         result = y.map<float*>();
         run = xrt::run(kernel);
         run.set_arg(0, uint32_t{3});
         run.set_arg(1, instructions);
         run.set_arg(2, static_cast<uint32_t>(code.size()));
-        run.set_arg(4, x);
         run.set_arg(5, y);
     }
+    bool stage(const float* activations, size_t tokens, ggml_type weight_type) {
+        const size_t block_elements = block * input_width;
+        const ggml_type dot = ggml_get_type_traits_cpu(weight_type)->vec_dot_type;
+        const size_t count = tokens * input_width;
+        if (staged_type == dot && previous_input.size() == count &&
+            std::memcmp(previous_input.data(), activations, count * sizeof(float)) == 0) return true;
+        // GGML may reuse an address for the next layer, or supply a new address with the same bytes.
+        // Store exactly one content snapshot per backend. Invalidate it before overwriting any BO.
+        staged_type = GGML_TYPE_COUNT;
+        previous_input.assign(activations, activations + count);
+        for (size_t t = 0; t < tokens; t += block) {
+            const size_t active = std::min(block,tokens-t) * input_width;
+            auto& bo = inputs[t/block];
+            if (!bo) bo = xrt::bo(device, block_elements*sizeof(ggml_bf16_t), xrt::bo::flags::host_only, 0);
+            auto* data = bo.map<ggml_bf16_t*>();
+            const float* src = previous_input.data() + t * input_width;
+            if (dot == GGML_TYPE_Q8_0 || dot == GGML_TYPE_Q8_K) {
+                codes.resize(ggml_row_size(dot, active));
+                rounded.resize(active);
+                ggml_get_type_traits_cpu(dot)->from_float(src, codes.data(), active);
+                if (dot == GGML_TYPE_Q8_K)
+                    dequantize_row_q8_K(reinterpret_cast<const block_q8_K*>(codes.data()), rounded.data(), active);
+                else
+                    ggml_get_type_traits(dot)->to_float(codes.data(), rounded.data(), active);
+                src = rounded.data();
+            }
+            ggml_fp32_to_bf16_row(src,data,active);
+            std::fill(data+active,data+block_elements,ggml_bf16_t{});
+            bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+        staged_type = dot;
+        return false;
+    }
 };
+
+// Restore the fifth bit and signed offset, multiply by the stored binary16 scale,
+// then round each float to nearest-even BF16 exactly like the stock GGML converter.
+inline void unpack_q5_eight(__m128i nibble, uint32_t high, __m256 scale, uint16_t* target) {
+    const __m256i positions = _mm256_setr_epi32(0,1,2,3,4,5,6,7);
+    const __m256i one = _mm256_set1_epi32(1);
+    const __m256i sign_bits = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(high),positions),one);
+    const __m256i q = _mm256_add_epi32(_mm256_cvtepu8_epi32(nibble),
+                                        _mm256_slli_epi32(_mm256_sub_epi32(sign_bits,one),4));
+    const __m256i bits = _mm256_castps_si256(_mm256_mul_ps(_mm256_cvtepi32_ps(q),scale));
+    const __m256i bias = _mm256_add_epi32(_mm256_set1_epi32(0x7fff),_mm256_and_si256(_mm256_srli_epi32(bits,16),one));
+    const __m256i high_words = _mm256_srli_epi32(_mm256_add_epi32(bits,bias),16);
+    const __m128i words = _mm_packus_epi32(_mm256_castsi256_si128(high_words),_mm256_extracti128_si256(high_words,1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(target),words);
+}
+}
+
+struct PhoenixPrefill::Impl {
+    xrt::device device{0};
+    struct CachedProgram {
+        std::pair<size_t, size_t> shape;
+        std::unique_ptr<ProjectionProgram> program;
+    };
+    std::list<CachedProgram> programs;
+
+    Impl() {
+        const auto name = device.get_info<xrt::info::device::name>();
+        if (name.find("Phoenix") == std::string::npos && name.find("Hawk") == std::string::npos)
+            throw std::runtime_error("Unsupported Phoenix prefill device");
+    }
+    ProjectionProgram& program(size_t rows, size_t cols) {
+        const auto shape = std::make_pair(rows, cols);
+        auto found = std::find_if(programs.begin(), programs.end(),
+            [&](const CachedProgram& entry) { return entry.shape == shape; });
+        if (found != programs.end()) {
+            programs.splice(programs.begin(), programs, found);
+        } else {
+            // Release the oldest hardware context before requesting another from XRT.
+            constexpr size_t max_programs = 3;
+            if (programs.size() == max_programs)
+                programs.pop_back();
+            auto program = std::make_unique<ProjectionProgram>(device, rows, cols);
+            programs.push_front({shape, std::move(program)});
+        }
+        return *programs.front().program;
+    }
+};
+
+void PhoenixPrefill::decode_q5_0_row(const void* packed, uint16_t* dst, size_t columns) {
+    if (columns % QK5_0) throw std::invalid_argument("Incomplete Q5_0 row");
+    const auto* q = static_cast<const block_q5_0*>(packed);
+    for (size_t i = 0; i < columns; i += QK5_0, ++q) {
+        if ((q->d & 0x7c00) == 0x7c00) {
+            float values[QK5_0];
+            ggml_get_type_traits(GGML_TYPE_Q5_0)->to_float(q,values,QK5_0);
+            ggml_fp32_to_bf16_row(values,reinterpret_cast<ggml_bf16_t*>(dst+i),QK5_0);
+            continue;
+        }
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q->qs));
+        const __m128i mask = _mm_set1_epi8(15);
+        const __m128i low = _mm_and_si128(bytes,mask);
+        const __m128i high = _mm_and_si128(_mm_srli_epi16(bytes,4),mask);
+        uint32_t fifth;
+        std::memcpy(&fifth,q->qh,sizeof(fifth));
+        const __m256 scale = _mm256_broadcastss_ps(_mm_cvtph_ps(_mm_cvtsi32_si128(q->d)));
+        unpack_q5_eight(low,fifth,scale,dst+i);
+        unpack_q5_eight(_mm_srli_si128(low,8),fifth>>8,scale,dst+i+8);
+        unpack_q5_eight(high,fifth>>16,scale,dst+i+16);
+        unpack_q5_eight(_mm_srli_si128(high,8),fifth>>24,scale,dst+i+24);
+    }
+}
 
 PhoenixPrefill::PhoenixPrefill() : context_(std::make_unique<Impl>()) {}
 PhoenixPrefill::~PhoenixPrefill() = default;
@@ -96,18 +207,49 @@ void PhoenixPrefill::set_prepare_threads(int threads) {
 }
 
 bool PhoenixPrefill::supports(size_t rows, size_t columns, size_t tokens) {
-    return rows == output_width && columns == input_width && tokens >= 96 && tokens <= 4*block;
+    if (tokens > input_slots*block) return false;
+    if (rows == 2560 && columns == 960) return tokens >= 64;
+    return tokens >= block && ((rows == 7680 && columns == 2048) ||
+                              ((rows == 6144 || rows == 12288) && columns == 1536) ||
+                              (rows == 1536 && columns == 6144) ||
+                              (rows == 2048 && columns == 7680));
 }
 
 size_t PhoenixPrefill::packed_bytes(size_t rows, size_t columns) {
     if (!supports(rows, columns, block)) throw std::invalid_argument("Unsupported Phoenix prefill weight shape");
-    return rows*columns*sizeof(uint16_t);
+    return rows == 2560 ? rows*columns*sizeof(uint16_t) : (rows*columns/32)*20;
+}
+
+std::shared_ptr<const PhoenixPrefill::Prepared> PhoenixPrefill::prepare_q4(
+    size_t rows, size_t columns, const void* data, bool cpu_repacked) {
+    if (!data || rows == 2560 || !supports(rows, columns, block))
+        throw std::invalid_argument("Unsupported compact Phoenix prefill shape");
+    auto p = std::make_shared<Prepared>();
+    p->rows = rows;
+    p->columns = columns;
+    p->weights = xrt::bo(context_->device, packed_bytes(rows,columns), xrt::bo::flags::host_only, 0);
+    auto* target = p->weights.map<uint8_t*>();
+    const int threads = prepare_threads_;
+    auto range = [&](int worker) {
+        const size_t tiles = rows / 64;
+        phoenix_pack_q4_prompt_tiles(static_cast<const uint8_t*>(data), cpu_repacked, columns,
+                                     tiles * worker / threads, tiles * (worker + 1) / threads, target);
+    };
+    std::vector<std::future<void>> jobs;
+    for (int i=1; i<threads; ++i) jobs.emplace_back(std::async(std::launch::async, range, i));
+    range(0);
+    for (auto& job : jobs) job.get();
+    p->weights.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    return p;
 }
 
 std::shared_ptr<const PhoenixPrefill::Prepared> PhoenixPrefill::prepare(
     size_t rows, size_t columns, PhoenixMatvec::RowDecoder decode, void* source) {
-    if (!decode) throw std::invalid_argument("Missing Phoenix prefill weight decoder");
+    if (!decode || rows != 2560 || !supports(rows, columns, block))
+        throw std::invalid_argument("Unsupported Phoenix BF16 prefill preparation");
     auto p = std::make_shared<Prepared>();
+    p->rows = rows;
+    p->columns = columns;
     p->weights = xrt::bo(context_->device, packed_bytes(rows,columns), xrt::bo::flags::host_only, 0);
     auto * w = p->weights.map<uint16_t*>();
     const int threads = prepare_threads_;
@@ -125,24 +267,25 @@ std::shared_ptr<const PhoenixPrefill::Prepared> PhoenixPrefill::prepare(
     return p;
 }
 
-void PhoenixPrefill::compute(const Prepared& weights, const float* activations, float* out, size_t tokens) {
-    if (!activations || !out || !supports(output_width,input_width,tokens))
+bool PhoenixPrefill::compute(const Prepared& weights, const float* activations, float* out, size_t tokens,
+                             ggml_type weight_type) {
+    if (!activations || !out || tokens == 0 || tokens > input_slots*block)
         throw std::invalid_argument("Unsupported Phoenix prefill projection");
-    auto & ctx = *context_;
+    auto & ctx = context_->program(weights.rows, weights.columns);
+    const bool reused = ctx.stage(activations,tokens,weight_type);
     ctx.run.set_arg(3,weights.weights);
     for (size_t t=0; t<tokens; t+=block) {
         const size_t active = std::min(block,tokens-t);
-        ggml_fp32_to_bf16_row(activations+t*input_width,ctx.input,active*input_width);
-        std::fill(ctx.input+active*input_width,ctx.input+block*input_width,ggml_bf16_t{});
-        ctx.x.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        ctx.run.set_arg(4,ctx.inputs[t/block]);
         ctx.run.start();
         const auto state = ctx.run.wait(std::chrono::seconds(10));
         if (state == ERT_CMD_STATE_TIMEOUT) ctx.run.abort();
         if (state != ERT_CMD_STATE_COMPLETED)
             throw std::runtime_error("Phoenix prefill failed, XRT command state " +
                                      std::to_string(static_cast<int>(state)));
-        const size_t elements = active*output_width;
+        const size_t elements = active*weights.rows;
         ctx.y.sync(XCL_BO_SYNC_BO_FROM_DEVICE,elements*sizeof(float),0);
-        std::copy_n(ctx.result,elements,out+t*output_width);
+        std::copy_n(ctx.result,elements,out+t*weights.rows);
     }
+    return reused;
 }
